@@ -1,5 +1,0 @@
-{"type":"system","subtype":"init","timestamp":1700000000000,"session_id":"fixture-basic","cwd":"/tmp","model":"cursor-agent","permissionMode":"default","tools":[{"name":"read","description":"Read a file"},{"name":"write","description":"Write a file"}]}
-{"type":"user","timestamp":1700000001000,"session_id":"fixture-basic","message":{"role":"user","content":[{"type":"text","text":"Say hi."}]}}
-{"type":"assistant","timestamp":1700000002000,"session_id":"fixture-basic","message":{"role":"assistant","content":[{"type":"text","text":"Hi"}]}}
-{"type":"assistant","timestamp":1700000002500,"session_id":"fixture-basic","message":{"role":"assistant","content":[{"type":"text","text":"Hi there!"}]}}
-{"type":"result","subtype":"success","timestamp":1700000003000,"session_id":"fixture-basic","is_error":false}

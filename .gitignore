@@ -5,20 +5,18 @@ dist/
 bun.lock
 .env
 .env.*
+!.env.example
+data/
 auth.json
 direct-accounts.json
 .codex-preview/
-# Installer binaries (not source)
-cmd/installer/installer-binary
-opencode-cursor-installer
-installer
-opencode-cursor-*.log
 
-# OpenCode local config
+# Local agent config and work dirs
 .opencode/
 .claude/
 .sisyphus/
 .worktrees/
+compose.override.yml
 
 # Development documentation
 BUG_ANALYSIS.md

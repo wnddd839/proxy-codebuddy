@@ -1,3 +1,0 @@
-{"type":"system","subtype":"init","timestamp":1700000200000,"session_id":"fixture-error","cwd":"/tmp","model":"cursor-agent","permissionMode":"default","tools":[]}
-{"type":"user","timestamp":1700000201000,"session_id":"fixture-error","message":{"role":"user","content":[{"type":"text","text":"Trigger an error."}]}}
-{"type":"result","subtype":"error","timestamp":1700000202000,"session_id":"fixture-error","is_error":true,"error":{"message":"Mock error for testing","code":500,"details":"Test error triggered by fixture"}}

@@ -1,0 +1,12 @@
+.git
+.github
+.codex-preview
+node_modules
+dist
+data
+.env
+.env.*
+*.log
+auth.json
+direct-accounts.json
+compose.override.yml

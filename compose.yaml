@@ -1,0 +1,26 @@
+services:
+  gateway:
+    build: .
+    image: cursor-proxy:latest
+    container_name: cursor-proxy-gateway
+    restart: unless-stopped
+    env_file:
+      - .env
+    environment:
+      CURSOR_DIRECT_HOST: 0.0.0.0
+      CURSOR_DIRECT_PORT: 32126
+      CURSOR_DIRECT_AUTH_PATH: /data/auth.json
+      CURSOR_DIRECT_ACCOUNTS_PATH: /data/direct-accounts.json
+    volumes:
+      - ./data:/data
+
+  nginx:
+    image: nginx:1.27-alpine
+    container_name: cursor-proxy-nginx
+    restart: unless-stopped
+    depends_on:
+      - gateway
+    ports:
+      - "${CURSOR_PROXY_PUBLIC_PORT:-32124}:32124"
+    volumes:
+      - ./deploy/cursor-nginx.docker.conf:/etc/nginx/conf.d/default.conf:ro

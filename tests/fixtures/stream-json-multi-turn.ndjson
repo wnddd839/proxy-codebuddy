@@ -1,7 +1,0 @@
-{"type":"system","subtype":"init","timestamp":1700000300000,"session_id":"fixture-multi","cwd":"/tmp","model":"cursor-agent","permissionMode":"default","tools":[]}
-{"type":"user","timestamp":1700000301000,"session_id":"fixture-multi","message":{"role":"user","content":[{"type":"text","text":"Say hello."}]}}
-{"type":"assistant","timestamp":1700000301500,"session_id":"fixture-multi","message":{"role":"assistant","content":[{"type":"text","text":"Hello."}]}}
-{"type":"user","timestamp":1700000302000,"session_id":"fixture-multi","message":{"role":"user","content":[{"type":"text","text":"Add a fun fact."}]}}
-{"type":"assistant","timestamp":1700000302500,"session_id":"fixture-multi","message":{"role":"assistant","content":[{"type":"text","text":"Hello. Fun fact: octopuses have three hearts."}]}}
-{"type":"assistant","timestamp":1700000302600,"session_id":"fixture-multi","message":{"role":"assistant","content":[{"type":"text","text":"Hello. Fun fact: octopuses have three hearts. They are very clever."}]}}
-{"type":"result","subtype":"success","timestamp":1700000303000,"session_id":"fixture-multi","is_error":false}

@@ -7,61 +7,15 @@ on:
     branches: [main]
 
 jobs:
-  unit:
+  test:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
 
-      - uses: oven-sh/setup-bun@v2
+      - uses: actions/setup-node@v4
         with:
-          bun-version: latest
+          node-version: 22
 
-      - run: bun install
-
-      - run: bun run build
-
-      - name: Run unit suite
-        run: bun run test:ci:unit
-
-      - name: Unit job summary
-        if: always()
-        run: |
-          {
-            echo "## Unit Job"
-            echo "- Status: \`${{ job.status }}\`"
-            echo "- Command: \`bun run test:ci:unit\`"
-            echo "- Scope: tools + unit + competitive smoke tests"
-          } >> "$GITHUB_STEP_SUMMARY"
-
-  integration:
-    runs-on: ubuntu-latest
-    env:
-      CURSOR_ACP_TOOL_LOOP_MODE: opencode
-      CURSOR_ACP_ENABLE_OPENCODE_TOOLS: "true"
-      CURSOR_ACP_FORWARD_TOOL_CALLS: "false"
-      CURSOR_ACP_EMIT_TOOL_UPDATES: "false"
-    steps:
-      - uses: actions/checkout@v4
-
-      - uses: oven-sh/setup-bun@v2
-        with:
-          bun-version: latest
-
-      - run: bun install
-
-      - run: bun run build
-
-      - name: Run integration suite
-        run: bun run test:ci:integration
-
-      - name: Integration job summary
-        if: always()
-        run: |
-          {
-            echo "## Integration Job"
-            echo "- Status: \`${{ job.status }}\`"
-            echo "- Command: \`bun run test:ci:integration\`"
-            echo "- Loop mode: \`${CURSOR_ACP_TOOL_LOOP_MODE}\`"
-            echo "- Forward tool calls: \`${CURSOR_ACP_FORWARD_TOOL_CALLS}\`"
-            echo "- Emit tool updates: \`${CURSOR_ACP_EMIT_TOOL_UPDATES}\`"
-          } >> "$GITHUB_STEP_SUMMARY"
+      - run: npm ci
+      - run: npm run check
+      - run: npm test

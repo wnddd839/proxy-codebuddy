@@ -1,7 +1,0 @@
-{"type":"system","subtype":"init","timestamp":1700000100000,"session_id":"fixture-tool","cwd":"/tmp","model":"cursor-agent","permissionMode":"default","tools":[{"name":"read","description":"Read a file"}]}
-{"type":"user","timestamp":1700000101000,"session_id":"fixture-tool","message":{"role":"user","content":[{"type":"text","text":"Read /tmp/hello.txt"}]}}
-{"type":"assistant","timestamp":1700000101500,"session_id":"fixture-tool","message":{"role":"assistant","content":[{"type":"text","text":"Checking the file."}]}}
-{"type":"tool_call","subtype":"started","timestamp":1700000102000,"session_id":"fixture-tool","call_id":"call_1","tool_call":{"readToolCall":{"args":{"path":"/tmp/hello.txt"}}}}
-{"type":"tool_call","subtype":"completed","timestamp":1700000102400,"session_id":"fixture-tool","call_id":"call_1","tool_call":{"readToolCall":{"result":{"content":"hello","mimeType":"text/plain"}}}}
-{"type":"assistant","timestamp":1700000103000,"session_id":"fixture-tool","message":{"role":"assistant","content":[{"type":"text","text":"The file says: hello"}]}}
-{"type":"result","subtype":"success","timestamp":1700000103500,"session_id":"fixture-tool","is_error":false}
