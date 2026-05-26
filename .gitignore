@@ -3,6 +3,11 @@ dist/
 *.log
 .DS_Store
 bun.lock
+.env
+.env.*
+auth.json
+direct-accounts.json
+.codex-preview/
 # Installer binaries (not source)
 cmd/installer/installer-binary
 opencode-cursor-installer

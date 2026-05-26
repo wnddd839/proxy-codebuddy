@@ -6,6 +6,7 @@ import { existsSync } from "node:fs";
 import { homedir, platform } from "node:os";
 import path from "node:path";
 import { pathToFileURL } from "node:url";
+import { buildAdminClientUtils, buildAdminSharedStyles } from "./admin-shared.mjs";
 
 const DEFAULT_MODELS = [
   { id: "auto", name: "Auto" },
@@ -860,163 +861,7 @@ function buildAdminHtml() {
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
   <title>Cursor 网关</title>
-  <style>
-    :root {
-      --bg: #0f1115;
-      --panel: #161a21;
-      --panel-2: #1d232d;
-      --line: #2c3440;
-      --text: #e9eef7;
-      --muted: #9ea7b6;
-      --faint: #6d7787;
-      --accent: #efb84d;
-      --accent-2: #69d2ff;
-      --good: #4ed18c;
-      --warn: #f4b860;
-      --bad: #ea6b7a;
-      --shadow: 0 14px 40px rgba(0,0,0,.34);
-    }
-    * { box-sizing: border-box; }
-    html, body { margin: 0; min-height: 100%; background:
-      linear-gradient(180deg, rgba(255,255,255,.03), transparent 28%),
-      radial-gradient(circle at top left, rgba(239,184,77,.10), transparent 25%),
-      linear-gradient(135deg, #0b0d11 0%, #11151b 38%, #0d1116 100%);
-      color: var(--text); font: 14px/1.5 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; letter-spacing: 0; }
-    body::before {
-      content: ""; position: fixed; inset: 0; pointer-events: none;
-      background-image: linear-gradient(rgba(255,255,255,.03) 1px, transparent 1px), linear-gradient(90deg, rgba(255,255,255,.03) 1px, transparent 1px);
-      background-size: 22px 22px;
-      mask-image: linear-gradient(180deg, rgba(0,0,0,.5), rgba(0,0,0,.15));
-      opacity: .16;
-    }
-    .shell { position: relative; max-width: 1500px; margin: 0 auto; padding: 24px; }
-    .topbar {
-      display: flex; align-items: center; justify-content: space-between; gap: 16px;
-      border: 1px solid var(--line); background: rgba(22,26,33,.88); box-shadow: var(--shadow);
-      padding: 18px 20px; border-radius: 8px; backdrop-filter: blur(8px);
-    }
-    .brand { display: flex; align-items: center; gap: 14px; }
-    .mark {
-      width: 42px; height: 42px; border-radius: 8px; background: linear-gradient(145deg, var(--accent), #ffcf79);
-      color: #111; display: grid; place-items: center; font-weight: 800; font-size: 15px;
-      box-shadow: inset 0 -1px 0 rgba(255,255,255,.2);
-    }
-    .title { margin: 0; font: 700 18px/1.1 Georgia, "Times New Roman", serif; letter-spacing: .02em; }
-    .subtitle { color: var(--muted); font-size: 12px; margin-top: 4px; }
-    .actions { display: flex; gap: 10px; flex-wrap: wrap; justify-content: flex-end; }
-    button {
-      appearance: none; border: 1px solid var(--line); background: linear-gradient(180deg, #232a35, #1a2029);
-      color: var(--text); padding: 10px 14px; border-radius: 8px; font: inherit; cursor: pointer;
-    }
-    button:hover { border-color: #415069; }
-    button.primary { background: linear-gradient(180deg, #f1c55f, #d79d23); color: #1b1404; border-color: #f7d28b; font-weight: 700; }
-    button.ghost { background: transparent; }
-    .layout { display: grid; grid-template-columns: 260px minmax(0,1fr); gap: 18px; margin-top: 18px; }
-    .sidebar, .panel, .login {
-      border: 1px solid var(--line); background: rgba(22,26,33,.88); box-shadow: var(--shadow); border-radius: 8px;
-    }
-    .sidebar { padding: 16px; position: sticky; top: 18px; height: fit-content; }
-    .navgroup { display: grid; gap: 8px; }
-    .navitem { display: flex; justify-content: space-between; gap: 10px; padding: 10px 12px; border-radius: 8px; background: #131820; color: var(--muted); }
-    .navitem strong { color: var(--text); font-weight: 700; }
-    .navitem span { color: var(--faint); }
-    .panel { padding: 18px; }
-    .grid { display: grid; gap: 18px; }
-    .cards { display: grid; grid-template-columns: repeat(4, minmax(0,1fr)); gap: 14px; }
-    .card {
-      border: 1px solid var(--line); background: linear-gradient(180deg, rgba(29,35,45,.96), rgba(20,24,31,.96));
-      border-radius: 8px; padding: 14px; min-height: 116px;
-    }
-    .label { color: var(--muted); text-transform: uppercase; font-size: 11px; letter-spacing: .12em; }
-    .value { margin-top: 8px; font-size: 30px; font-weight: 800; line-height: 1; }
-    .hint { margin-top: 8px; color: var(--faint); font-size: 12px; }
-    .section { margin-top: 18px; border-top: 1px solid var(--line); padding-top: 18px; }
-    .section h2 { margin: 0 0 12px; font: 700 15px/1.2 Georgia, "Times New Roman", serif; }
-    .stack { display: grid; gap: 12px; }
-    .split { display: grid; grid-template-columns: repeat(2, minmax(0,1fr)); gap: 14px; }
-    .mono-box {
-      border: 1px solid var(--line); background: #10141a; border-radius: 8px; padding: 14px; overflow: auto; white-space: pre-wrap;
-    }
-    .table { width: 100%; border-collapse: collapse; }
-    .table th, .table td { text-align: left; padding: 10px 8px; border-bottom: 1px solid #27303d; vertical-align: top; }
-    .table th { color: var(--muted); font-size: 11px; text-transform: uppercase; letter-spacing: .12em; }
-    .status {
-      display: inline-flex; align-items: center; gap: 6px; padding: 5px 8px; border-radius: 999px; border: 1px solid var(--line);
-      font-size: 12px;
-    }
-    .dot { width: 8px; height: 8px; border-radius: 999px; background: var(--good); box-shadow: 0 0 0 3px rgba(78,209,140,.15); }
-    .dot.warn { background: var(--warn); box-shadow: 0 0 0 3px rgba(244,184,96,.12); }
-    .dot.bad { background: var(--bad); box-shadow: 0 0 0 3px rgba(234,107,122,.12); }
-    .field { display: grid; gap: 8px; }
-    label { color: var(--muted); font-size: 12px; text-transform: uppercase; letter-spacing: .12em; }
-    input, textarea {
-      width: 100%; border: 1px solid var(--line); background: #0f1319; color: var(--text);
-      border-radius: 8px; padding: 11px 12px; font: inherit;
-    }
-    textarea { min-height: 140px; resize: vertical; }
-    .login-wrap {
-      min-height: 100vh; display: grid; place-items: center; padding: 24px;
-    }
-    .login {
-      width: min(560px, 100%); padding: 22px;
-    }
-    .login h1 { margin: 0; font: 700 28px/1.1 Georgia, "Times New Roman", serif; }
-    .login p { margin: 10px 0 20px; color: var(--muted); }
-    .row { display: flex; gap: 10px; flex-wrap: wrap; }
-    .muted { color: var(--muted); }
-    .hidden { display: none !important; }
-    .footerline { margin-top: 18px; color: var(--faint); font-size: 12px; display:flex; justify-content:space-between; gap: 10px; flex-wrap: wrap; }
-    .hero-panel {
-      margin-top: 18px; border: 1px solid var(--line); background: linear-gradient(135deg, rgba(29,35,45,.96), rgba(16,20,27,.96));
-      box-shadow: var(--shadow); border-radius: 8px; padding: 18px; display: grid; gap: 16px;
-    }
-    .hero-head { display: flex; justify-content: space-between; gap: 16px; align-items: flex-start; flex-wrap: wrap; }
-    .hero-kicker { color: var(--accent); font-weight: 800; font-size: 12px; text-transform: uppercase; letter-spacing: .12em; }
-    .hero-title { margin-top: 8px; font: 700 24px/1.15 Georgia, "Times New Roman", serif; }
-    .hero-copy { margin-top: 8px; max-width: 760px; color: var(--muted); }
-    .hero-actions { display: flex; gap: 10px; flex-wrap: wrap; justify-content: flex-end; }
-    .quick-grid { display: grid; grid-template-columns: repeat(4, minmax(0,1fr)); gap: 12px; }
-    .quick-card {
-      border: 1px solid rgba(255,255,255,.10); background: rgba(8,11,15,.42); border-radius: 8px; padding: 13px; min-height: 94px;
-    }
-    .quick-card .value { font-size: 22px; overflow-wrap: anywhere; }
-    .pill-row { display: flex; gap: 8px; flex-wrap: wrap; }
-    .pill {
-      display: inline-flex; align-items: center; gap: 6px; border: 1px solid var(--line); border-radius: 999px;
-      padding: 6px 9px; color: var(--muted); background: rgba(15,19,25,.7); font-size: 12px;
-    }
-    .pill.good { color: var(--good); border-color: rgba(78,209,140,.35); }
-    .pill.warn { color: var(--warn); border-color: rgba(244,184,96,.35); }
-    .ops-grid { display: grid; grid-template-columns: minmax(0, 1.2fr) minmax(320px, .8fr); gap: 14px; }
-    .copyline { display: flex; align-items: stretch; gap: 8px; }
-    .copyline input { min-width: 0; }
-    .latency-steps { display: grid; grid-template-columns: repeat(3, minmax(0,1fr)); gap: 10px; margin-top: 10px; }
-    .step {
-      border: 1px dashed rgba(255,255,255,.16); border-radius: 8px; padding: 10px; color: var(--muted); min-height: 78px;
-    }
-    .step strong { display: block; color: var(--text); margin-bottom: 4px; }
-    select {
-      width: 100%; border: 1px solid var(--line); background: #0f1319; color: var(--text);
-      border-radius: 8px; padding: 11px 12px; font: inherit;
-    }
-    @media (max-width: 1100px) {
-      .layout { grid-template-columns: 1fr; }
-      .sidebar { position: static; }
-      .cards { grid-template-columns: repeat(2, minmax(0,1fr)); }
-      .split { grid-template-columns: 1fr; }
-      .quick-grid { grid-template-columns: repeat(2, minmax(0,1fr)); }
-      .ops-grid { grid-template-columns: 1fr; }
-      .latency-steps { grid-template-columns: 1fr; }
-    }
-    @media (max-width: 640px) {
-      .shell { padding: 14px; }
-      .topbar { flex-direction: column; align-items: flex-start; }
-      .cards { grid-template-columns: 1fr; }
-      .quick-grid { grid-template-columns: 1fr; }
-      .copyline { display: grid; }
-      .value { font-size: 24px; }
-    }
-  </style>
+  <style>${buildAdminSharedStyles()}</style>
 </head>
 <body>
   <div class="login-wrap" id="loginView">
@@ -1025,7 +870,7 @@ function buildAdminHtml() {
         <div class="mark">CG</div>
         <div>
           <h1>Cursor 网关</h1>
-          <div class="subtitle">服务器 OAuth 与 NewAPI 代理控制台</div>
+          <div class="sub">服务器 OAuth 与 NewAPI 代理控制台</div>
         </div>
       </div>
       <p>输入管理密码后，可以查看运行状态、管理 Cursor 账号登录态，并复制 NewAPI 接入地址。</p>
@@ -1044,13 +889,13 @@ function buildAdminHtml() {
     </div>
   </div>
 
-  <div class="shell hidden" id="appView">
-    <div class="topbar">
+  <main class="shell hidden" id="appView">
+    <header class="topbar">
       <div class="brand">
         <div class="mark">CG</div>
         <div>
           <div class="title">Cursor 网关</div>
-          <div class="subtitle" id="runtimeSubtitle">正在读取运行状态...</div>
+          <div class="sub" id="runtimeSubtitle">正在读取运行状态...</div>
         </div>
       </div>
       <div class="actions">
@@ -1058,7 +903,7 @@ function buildAdminHtml() {
         <button id="copyBaseBtn">复制基础地址</button>
         <button id="logoutBtn" class="ghost">退出管理</button>
       </div>
-    </div>
+    </header>
 
     <section class="hero-panel">
       <div class="hero-head">
@@ -1073,28 +918,37 @@ function buildAdminHtml() {
         </div>
       </div>
 
-      <div class="quick-grid">
-        <div class="quick-card">
+      <div class="status-pills">
+        <span class="pill good"><strong>健康</strong> <span id="navHealth">-</span></span>
+        <span class="pill"><strong>账号</strong> <span id="navAccount">-</span></span>
+        <span class="pill"><strong>模型</strong> <span id="navModels">-</span></span>
+        <span class="pill"><strong>请求</strong> <span id="navRequests">-</span></span>
+        <span class="pill"><strong>内存</strong> <span id="navMemory">-</span></span>
+        <span class="pill"><strong>API 密钥</strong> <span id="navApiKey">-</span></span>
+      </div>
+
+      <section class="metric-grid">
+        <div class="metric">
           <div class="label">当前账号</div>
-          <div class="value" id="heroAccount">-</div>
+          <div class="value multiline" id="heroAccount">-</div>
           <div class="hint" id="heroPlan">等待账号状态</div>
         </div>
-        <div class="quick-card">
+        <div class="metric">
           <div class="label">NewAPI Base URL</div>
           <div class="value" id="heroBaseUrl">-</div>
           <div class="hint">渠道类型选 OpenAI 兼容，密钥使用网关 API Key。</div>
         </div>
-        <div class="quick-card">
+        <div class="metric">
           <div class="label">最近耗时</div>
           <div class="value" id="heroLatency">-</div>
           <div class="hint" id="heroAvgLatency">平均耗时等待请求后统计</div>
         </div>
-        <div class="quick-card">
+        <div class="metric">
           <div class="label">运行模式</div>
           <div class="value" id="heroMode">CLI</div>
-          <div class="hint">当前是稳定优先的 CLI-per-request 模式。</div>
+          <div class="hint">活跃 <span id="statActive">0</span> · 成功/失败 <span id="statSuccess">0 / 0</span> · RSS <span id="statRss">0 MB</span> · 运行 <span id="statUptime">0s</span></div>
         </div>
-      </div>
+      </section>
 
       <div class="ops-grid">
         <div class="stack">
@@ -1105,7 +959,7 @@ function buildAdminHtml() {
               <button id="copyInlineBaseBtn" type="button">复制</button>
             </div>
           </div>
-          <div class="pill-row" id="recommendedModels">
+          <div class="status-pills" id="recommendedModels">
             <span class="pill">composer-2-fast</span>
             <span class="pill">composer-2.5-fast</span>
             <span class="pill">auto</span>
@@ -1123,7 +977,9 @@ function buildAdminHtml() {
           <div class="row">
             <button id="runProbeBtn" class="primary" type="button">跑一次延迟自检</button>
           </div>
-          <div class="mono-box" id="probeResult">还没有运行探针。</div>
+          <div class="probe-result" id="probeResult">
+            <div class="probe-line">还没有运行探针。</div>
+          </div>
         </div>
       </div>
 
@@ -1134,141 +990,111 @@ function buildAdminHtml() {
       </div>
     </section>
 
-    <div class="layout">
-      <aside class="sidebar">
-        <div class="navgroup" id="navgroup">
-          <div class="navitem"><strong>健康</strong><span id="navHealth">-</span></div>
-          <div class="navitem"><strong>账号</strong><span id="navAccount">-</span></div>
-          <div class="navitem"><strong>模型</strong><span id="navModels">-</span></div>
-          <div class="navitem"><strong>请求</strong><span id="navRequests">-</span></div>
-          <div class="navitem"><strong>内存</strong><span id="navMemory">-</span></div>
-          <div class="navitem"><strong>API 密钥</strong><span id="navApiKey">-</span></div>
+    <div class="content">
+      <section class="panel">
+        <h2>Cursor OAuth 登录</h2>
+        <div class="split">
+          <div class="stack">
+            <div class="panel" style="padding:14px; box-shadow:none;">
+              <div class="label">账号状态</div>
+              <div class="mono-box" id="accountBox" style="margin-top:12px; min-height: 140px;">正在读取账号状态...</div>
+              <div class="row" style="margin-top:12px;">
+                <button class="primary" id="startOAuthBtn">生成 Cursor 授权链接</button>
+                <button id="openOAuthBtn" type="button">打开链接</button>
+                <button id="logoutCursorBtn" class="ghost" type="button">退出 Cursor 账号</button>
+              </div>
+            </div>
+            <div class="panel" style="padding:14px; box-shadow:none;">
+              <div class="label">OAuth 会话</div>
+              <div class="mono-box" id="oauthStatus" style="margin-top:12px; min-height: 100px;">未开始登录。</div>
+            </div>
+          </div>
+          <div class="stack">
+            <div class="field">
+              <label for="oauthUrl">授权链接</label>
+              <textarea id="oauthUrl" readonly placeholder="点击生成后显示 Cursor 授权链接"></textarea>
+            </div>
+            <div class="field">
+              <label for="callbackUrl">回调 URL / 授权完成结果</label>
+              <input id="callbackUrl" placeholder="浏览器授权后，如果出现最终跳转地址，把完整 URL 粘贴到这里" />
+              <div class="hint">Cursor CLI 通常会自动接收浏览器授权；这里的回调框用于兼容需要手动提交结果的情况。</div>
+            </div>
+            <div class="row">
+              <button id="copyOAuthBtn" type="button">复制授权链接</button>
+              <button id="submitCallbackBtn" class="primary" type="button">提交回调 / 检查登录</button>
+            </div>
+          </div>
         </div>
-      </aside>
+      </section>
 
-      <main class="grid">
-        <section class="cards">
-          <div class="card">
-            <div class="label">主动请求</div>
-            <div class="value" id="statActive">0</div>
-            <div class="hint">当前正在网关中运行的请求。</div>
-          </div>
-          <div class="card">
-            <div class="label">成功 / 失败</div>
-            <div class="value" id="statSuccess">0 / 0</div>
-            <div class="hint">已完成请求和被拒绝调用。</div>
-          </div>
-          <div class="card">
-            <div class="label">RSS 内存</div>
-            <div class="value" id="statRss">0 MB</div>
-            <div class="hint">Node 进程当前内存占用。</div>
-          </div>
-          <div class="card">
-            <div class="label">正常运行时间</div>
-            <div class="value" id="statUptime">0s</div>
-            <div class="hint">服务启动后的运行时长。</div>
-          </div>
-        </section>
+      <section class="panel">
+        <h2>接入地址</h2>
+        <div class="endpoint-list" id="endpointList"></div>
+      </section>
 
-        <section class="panel">
-          <h2>Cursor OAuth 登录</h2>
-          <div class="split">
-            <div class="stack">
-              <div class="card">
-                <div class="label">账号状态</div>
-                <div class="mono-box" id="accountBox" style="margin-top:12px; min-height: 160px;">正在读取账号状态...</div>
-                <div class="row" style="margin-top:12px;">
-                  <button class="primary" id="startOAuthBtn">生成 Cursor 授权链接</button>
-                  <button id="openOAuthBtn" type="button">打开链接</button>
-                  <button id="logoutCursorBtn" class="ghost" type="button">退出 Cursor 账号</button>
-                </div>
-              </div>
-              <div class="card">
-                <div class="label">OAuth 会话</div>
-                <div class="mono-box" id="oauthStatus" style="margin-top:12px; min-height: 120px;">未开始登录。</div>
-              </div>
+      <section class="panel">
+        <h2>运行状态</h2>
+        <div class="split">
+          <div class="mono-box" id="runtimeBox">正在读取...</div>
+          <div class="stack">
+            <div class="panel" style="padding:14px; box-shadow:none;">
+              <div class="label">API 表面</div>
+              <div class="hint" style="margin-top:8px;">给 NewAPI 使用的 OpenAI 兼容端点。</div>
+              <div class="mono-box" id="apiSurface" style="margin-top:12px; min-height: 88px;"></div>
             </div>
-            <div class="stack">
-              <div class="field">
-                <label for="oauthUrl">授权链接</label>
-                <textarea id="oauthUrl" readonly placeholder="点击生成后显示 Cursor 授权链接"></textarea>
-              </div>
-              <div class="field">
-                <label for="callbackUrl">回调 URL / 授权完成结果</label>
-                <input id="callbackUrl" placeholder="浏览器授权后，如果出现最终跳转地址，把完整 URL 粘贴到这里" />
-                <div class="hint">Cursor CLI 通常会自动接收浏览器授权；这里的回调框用于兼容需要手动提交结果的情况。</div>
-              </div>
-              <div class="row">
-                <button id="copyOAuthBtn" type="button">复制授权链接</button>
-                <button id="submitCallbackBtn" class="primary" type="button">提交回调 / 检查登录</button>
-              </div>
+            <div class="panel" style="padding:14px; box-shadow:none;">
+              <div class="label">凭据</div>
+              <div class="hint" style="margin-top:8px;">管理认证和请求 API 密钥刻意分开。</div>
+              <div class="mono-box" id="credentialBox" style="margin-top:12px; min-height: 88px;"></div>
             </div>
           </div>
-        </section>
+        </div>
+      </section>
 
-        <section class="panel">
-          <h2>运行状态</h2>
-          <div class="split">
-            <div class="mono-box" id="runtimeBox">正在读取...</div>
-            <div class="stack">
-              <div class="card">
-                <div class="label">API 表面</div>
-                <div class="hint" style="margin-top:10px;">给 NewAPI 使用的 OpenAI 兼容端点。</div>
-                <div class="mono-box" id="apiSurface" style="margin-top:12px; min-height: 88px;"></div>
-              </div>
-              <div class="card">
-                <div class="label">凭据</div>
-                <div class="hint" style="margin-top:10px;">管理认证和请求 API 密钥刻意分开。</div>
-                <div class="mono-box" id="credentialBox" style="margin-top:12px; min-height: 88px;"></div>
-              </div>
-            </div>
+      <section class="panel">
+        <h2>模型</h2>
+        <div class="table-wrap">
+          <table class="table">
+            <thead>
+              <tr>
+                <th style="width: 36%;">模型</th>
+                <th style="width: 22%;">提供方</th>
+                <th style="width: 22%;">创建时间</th>
+                <th>备注</th>
+              </tr>
+            </thead>
+            <tbody id="modelsBody">
+              <tr><td colspan="4" class="muted">正在读取模型...</td></tr>
+            </tbody>
+          </table>
+        </div>
+      </section>
+
+      <details class="advanced-panel">
+        <summary>配置快照（高级）</summary>
+        <div class="advanced-body split">
+          <div class="field">
+            <label>网关状态</label>
+            <textarea id="statusJson" readonly></textarea>
           </div>
-        </section>
-
-        <section class="panel">
-          <h2>模型</h2>
-          <div class="mono-box" style="padding:0;">
-            <table class="table">
-              <thead>
-                <tr>
-                  <th style="width: 36%;">模型</th>
-                  <th style="width: 22%;">提供方</th>
-                  <th style="width: 22%;">创建时间</th>
-                  <th>备注</th>
-                </tr>
-              </thead>
-              <tbody id="modelsBody">
-                <tr><td colspan="4" class="muted">正在读取模型...</td></tr>
-              </tbody>
-            </table>
-          </div>
-        </section>
-
-        <section class="panel">
-          <h2>配置快照</h2>
-          <div class="split">
-            <div class="field">
-              <label>网关状态</label>
-              <textarea id="statusJson" readonly></textarea>
-            </div>
-            <div class="field">
-              <label>提示词过滤</label>
-              <textarea readonly>系统内容中的环境噪音会被剔除。
+          <div class="field">
+            <label>提示词过滤</label>
+            <textarea readonly>系统内容中的环境噪音会被剔除。
 过长的 system prompt 会按配置上限截断。
 工具结果和推理内容只保留 cursor-agent 实际输出的部分。</textarea>
-            </div>
           </div>
-        </section>
+        </div>
+      </details>
 
-        <section class="panel">
-          <h2>OpenAI 接入</h2>
-          <div class="mono-box" id="probeBox">在 NewAPI 中使用同一个 API Key，并把渠道基础地址指向上面显示的 /v1。</div>
-        </section>
-      </main>
+      <section class="panel">
+        <h2>OpenAI 接入</h2>
+        <div class="mono-box" id="probeBox">在 NewAPI 中使用同一个 API Key，并把渠道基础地址指向上面显示的 /v1。</div>
+      </section>
     </div>
-  </div>
+  </main>
 
   <script>
+    ${buildAdminClientUtils()}
     const cleanPath = window.location.pathname.replace(/\\/+$/, '');
     const inferredPrefix = cleanPath.endsWith('/admin') ? cleanPath.slice(0, -('/admin'.length)) : '';
     const state = {
@@ -1287,22 +1113,14 @@ function buildAdminHtml() {
 
     function setText(id, value) {
       const node = $(id);
-      if (node) node.textContent = value;
+      if (!node) return;
+      node.textContent = value;
+      if (node.classList && node.classList.contains('value')) node.title = value;
     }
 
     function setValue(id, value) {
       const node = $(id);
       if (node) node.value = value;
-    }
-
-    function escapeHtml(value) {
-      return String(value ?? '').replace(/[&<>"']/g, (char) => ({
-        '&': '&amp;',
-        '<': '&lt;',
-        '>': '&gt;',
-        '"': '&quot;',
-        "'": '&#39;',
-      })[char]);
     }
 
     function setStatus(msg) {
@@ -1315,8 +1133,7 @@ function buildAdminHtml() {
     }
 
     function authHeaders() {
-      const headers = { 'X-Admin-Password': state.token };
-      return headers;
+      return { 'X-Admin-Password': state.token };
     }
 
     async function api(path, options = {}) {
@@ -1326,9 +1143,7 @@ function buildAdminHtml() {
         headers,
         body: options.body,
       });
-      if (response.status === 401) {
-        throw new Error('unauthorized');
-      }
+      if (response.status === 401) throw new Error('unauthorized');
       const text = await response.text();
       let data = null;
       try { data = text ? JSON.parse(text) : null; } catch { data = text; }
@@ -1339,14 +1154,6 @@ function buildAdminHtml() {
       return data;
     }
 
-    function fmtBytes(bytes) {
-      const units = ['B','KB','MB','GB'];
-      let value = Number(bytes) || 0;
-      let idx = 0;
-      while (value >= 1024 && idx < units.length - 1) { value /= 1024; idx += 1; }
-      return value.toFixed(value >= 10 || idx === 0 ? 0 : 1) + ' ' + units[idx];
-    }
-
     function fmtDuration(ms) {
       const total = Math.max(0, Math.floor(Number(ms) || 0));
       const sec = Math.floor(total / 1000);
@@ -1355,13 +1162,6 @@ function buildAdminHtml() {
       if (hour) return hour + '小时' + (min % 60) + '分钟';
       if (min) return min + '分钟' + (sec % 60) + '秒';
       return sec + '秒';
-    }
-
-    function fmtMs(ms) {
-      const value = Math.max(0, Math.round(Number(ms) || 0));
-      if (!value) return '-';
-      if (value >= 1000) return (value / 1000).toFixed(value >= 10000 ? 1 : 2) + 's';
-      return value + 'ms';
     }
 
     function setModels(rows) {
@@ -1391,6 +1191,10 @@ function buildAdminHtml() {
       }
     }
 
+    function renderProbeResult(lines) {
+      $('probeResult').innerHTML = lines.map((line) => '<div class="probe-line">' + line + '</div>').join('');
+    }
+
     function renderAccountPanel(accountPayload = state.accountPayload) {
       const account = accountPayload && accountPayload.account ? accountPayload.account : {};
       const oauth = accountPayload && accountPayload.oauth ? accountPayload.oauth : state.oauthSession || {};
@@ -1409,7 +1213,7 @@ function buildAdminHtml() {
       }
       $('openOAuthBtn').disabled = !url;
       $('copyOAuthBtn').disabled = !url;
-      setText('heroAccount', loggedIn ? email : '未登录');
+      setText('heroAccount', truncateText(email, 42));
       setText('heroPlan', [
         '账号等级: ' + (about.subscriptionTier || '-'),
         'CLI 版本: ' + (about.cliVersion || '-'),
@@ -1447,6 +1251,7 @@ function buildAdminHtml() {
 
       const account = state.accountPayload && state.accountPayload.account ? state.accountPayload.account : {};
       const about = account.about || {};
+      const apiBase = state.baseUrl + '/v1';
       $('runtimeSubtitle').textContent = status.workspace + '  |  ' + status.mode;
       $('navHealth').textContent = '正常';
       $('navModels').textContent = String(models.length);
@@ -1478,22 +1283,16 @@ function buildAdminHtml() {
       $('statusJson').value = JSON.stringify(status, null, 2);
       $('apiSurface').textContent = [
         '健康检查  GET  ' + state.baseUrl + '/health',
-        '模型列表  GET  ' + state.baseUrl + '/v1/models',
-        '聊天补全  POST ' + state.baseUrl + '/v1/chat/completions',
+        '模型列表  GET  ' + apiBase + '/models',
+        '聊天补全  POST ' + apiBase + '/chat/completions',
       ].join('\\n');
       $('credentialBox').textContent = [
         '管理密码: ' + (status.adminPasswordSet ? '已配置' : '缺失'),
         '调用 API Key: ' + (status.apiKeyConfigured ? '已配置' : '缺失'),
-        'NewAPI 基础地址: ' + state.baseUrl + '/v1',
+        'NewAPI 基础地址: ' + apiBase,
       ].join('\\n');
-      $('newApiBaseUrl').value = state.baseUrl + '/v1';
-      $('heroBaseUrl').textContent = state.baseUrl + '/v1';
-      $('heroAccount').textContent = account.loggedIn ? (about.userEmail || '已登录') : '未登录';
-      $('heroPlan').textContent = [
-        '账号等级: ' + (about.subscriptionTier || '-'),
-        'CLI 版本: ' + (about.cliVersion || '-'),
-        '模型数: ' + (Array.isArray(account.models) ? account.models.length : 0),
-      ].join(' · ');
+      $('newApiBaseUrl').value = apiBase;
+      setText('heroBaseUrl', truncateText(apiBase, 36));
       $('heroLatency').textContent = fmtMs(status.stats.lastDurationMs);
       $('heroAvgLatency').textContent = '平均 ' + fmtMs(status.stats.averageDurationMs) + ' · 最近 ' + (status.stats.lastTotalTokens || 0) + ' tokens · 错误 ' + (status.stats.lastError || '-');
       $('heroMode').textContent = status.latency && status.latency.mode ? status.latency.mode : 'cli-per-request';
@@ -1508,19 +1307,31 @@ function buildAdminHtml() {
         recommended.innerHTML = status.latency.recommendedFastModels.map((model) => '<span class="pill good">' + escapeHtml(model) + '</span>').join('');
       }
 
+      $('endpointList').innerHTML = [
+        renderEndpoint('GET', state.baseUrl + '/health'),
+        renderEndpoint('GET', apiBase + '/models'),
+        renderEndpoint('POST', apiBase + '/chat/completions'),
+      ].join('');
+      bindCopyButtons($('endpointList'));
+
       renderAccountPanel(state.accountPayload);
       setModels(models);
     }
 
     async function refresh() {
+      $('refreshBtn').disabled = true;
       setStatus('正在刷新...');
-      const [status, models, accountPayload] = await Promise.all([
-        api('/status'),
-        api('/models'),
-        api('/account'),
-      ]);
-      render(status, Array.isArray(models.data) ? models.data : [], accountPayload);
-      setStatus('已刷新。');
+      try {
+        const [status, models, accountPayload] = await Promise.all([
+          api('/status'),
+          api('/models'),
+          api('/account'),
+        ]);
+        render(status, Array.isArray(models.data) ? models.data : [], accountPayload);
+        setStatus('已刷新。');
+      } finally {
+        $('refreshBtn').disabled = false;
+      }
     }
 
     async function login() {
@@ -1561,9 +1372,7 @@ function buildAdminHtml() {
         state.accountPayload = { account: result.account || {}, oauth: result.session || {} };
         state.oauthUrl = result.session && result.session.url ? result.session.url : state.oauthUrl;
         renderAccountPanel(state.accountPayload);
-        if (state.oauthUrl) {
-          await navigator.clipboard.writeText(state.oauthUrl).catch(() => {});
-        }
+        if (state.oauthUrl) await copyText(state.oauthUrl, '授权链接');
       } catch (error) {
         $('oauthStatus').textContent = '生成授权链接失败: ' + error.message;
       }
@@ -1588,7 +1397,8 @@ function buildAdminHtml() {
     async function runProbe() {
       const model = $('probeModel').value || 'composer-2-fast';
       const started = performance.now();
-      $('probeResult').textContent = '正在请求 ' + model + '，这会消耗一次 Cursor 调用...';
+      renderProbeResult(['<strong>状态</strong> 正在请求 ' + escapeHtml(model) + '，这会消耗一次 Cursor 调用...']);
+      $('runProbeBtn').disabled = true;
       try {
         const result = await api('/probe', {
           method: 'POST',
@@ -1596,15 +1406,17 @@ function buildAdminHtml() {
           body: JSON.stringify({ model }),
         });
         const browserMs = Math.round(performance.now() - started);
-        $('probeResult').textContent = [
-          '模型: ' + result.model,
-          '服务端总耗时: ' + fmtMs(result.durationMs),
-          '浏览器感知耗时: ' + fmtMs(browserMs),
-          '返回预览: ' + (result.contentPreview || '-'),
-        ].join('\\n');
+        renderProbeResult([
+          '<strong>模型</strong> ' + escapeHtml(result.model),
+          '<strong>服务端总耗时</strong> ' + escapeHtml(fmtMs(result.durationMs)),
+          '<strong>浏览器感知耗时</strong> ' + escapeHtml(fmtMs(browserMs)),
+          '<strong>返回预览</strong> ' + escapeHtml(result.contentPreview || '-'),
+        ]);
         await refresh();
       } catch (error) {
-        $('probeResult').textContent = '延迟自检失败: ' + error.message;
+        renderProbeResult(['<strong>失败</strong> ' + escapeHtml(error.message)]);
+      } finally {
+        $('runProbeBtn').disabled = false;
       }
     }
 
@@ -1646,18 +1458,9 @@ function buildAdminHtml() {
       setStatus('已退出管理台。');
     });
     $('refreshBtn').addEventListener('click', refresh);
-    $('copyBaseBtn').addEventListener('click', async () => {
-      await navigator.clipboard.writeText(state.baseUrl + '/v1');
-      setStatus('基础地址已复制。');
-    });
-    $('copyHeroBaseBtn').addEventListener('click', async () => {
-      await navigator.clipboard.writeText(state.baseUrl + '/v1');
-      setStatus('NewAPI Base URL 已复制。');
-    });
-    $('copyInlineBaseBtn').addEventListener('click', async () => {
-      await navigator.clipboard.writeText(state.baseUrl + '/v1');
-      setStatus('NewAPI Base URL 已复制。');
-    });
+    $('copyBaseBtn').addEventListener('click', () => copyText(state.baseUrl + '/v1', 'Base URL'));
+    $('copyHeroBaseBtn').addEventListener('click', () => copyText(state.baseUrl + '/v1', 'NewAPI Base URL'));
+    $('copyInlineBaseBtn').addEventListener('click', () => copyText(state.baseUrl + '/v1', 'NewAPI Base URL'));
     $('heroStartOAuthBtn').addEventListener('click', startOAuth);
     $('startOAuthBtn').addEventListener('click', startOAuth);
     $('runProbeBtn').addEventListener('click', runProbe);
@@ -1666,7 +1469,7 @@ function buildAdminHtml() {
     });
     $('copyOAuthBtn').addEventListener('click', async () => {
       if (!state.oauthUrl) return;
-      await navigator.clipboard.writeText(state.oauthUrl);
+      await copyText(state.oauthUrl, '授权链接');
       $('oauthStatus').textContent = '授权链接已复制。';
     });
     $('submitCallbackBtn').addEventListener('click', submitCallback);

@@ -4,10 +4,15 @@ import assert from "node:assert/strict";
 import {
   buildDirectAdminHtml,
   buildDirectAdminStatusPayload,
+  createLegacyDirectAccount,
   extractStringsFromProtobuf,
+  importDirectAccounts,
+  isDirectAdminAuthorized,
   normalizeDirectModel,
   pickAssistantCandidate,
+  selectDirectAccount,
   summarizeCursorAuth,
+  summarizeDirectAccount,
 } from "../../cursor-direct-gateway.mjs";
 
 function encodeVarint(value) {
@@ -100,6 +105,9 @@ test("buildDirectAdminHtml uses the direct admin API prefix and NewAPI base path
   assert.match(page, /Cursor Direct/);
   assert.match(page, /\/direct-admin\/api/);
   assert.match(page, /\/v1/);
+  assert.match(page, /\/accounts\/import/);
+  assert.match(page, /\/oauth\/start/);
+  assert.match(page, /账号池/);
   assert.doesNotMatch(page, /cursor_gateway_admin_password/);
 });
 
@@ -112,4 +120,60 @@ test("buildDirectAdminStatusPayload includes direct runtime fields for the admin
   assert.equal(typeof payload.memory.rss, "number");
   assert.equal(typeof payload.stats.averageDurationMs, "number");
   assert.equal(typeof payload.authRequired, "boolean");
+});
+
+test("importDirectAccounts imports multiple accounts and summaries never expose full tokens", () => {
+  const store = { version: 1, nextIndex: 0, accounts: [] };
+  const accounts = [
+    { label: "alpha", accessToken: fakeJwt({ email: "a@example.com", sub: "sub_a" }), refreshToken: "refresh-alpha-secret" },
+    { label: "beta", accessToken: fakeJwt({ email: "b@example.com", sub: "sub_b" }), refreshToken: "refresh-beta-secret" },
+  ];
+
+  const result = importDirectAccounts(store, accounts, { now: 1000 });
+
+  assert.equal(result.store.accounts.length, 2);
+  assert.equal(result.summaries.length, 2);
+  assert.equal(result.summaries[0].email, "a@example.com");
+  assert.equal(result.summaries[0].accessToken, undefined);
+  assert.equal(result.summaries[0].refreshToken, undefined);
+  assert.notEqual(result.summaries[0].accessTokenPreview, accounts[0].accessToken);
+  assert.notEqual(result.summaries[0].refreshTokenPreview, accounts[0].refreshToken);
+});
+
+test("selectDirectAccount skips disabled accounts and rotates enabled accounts", () => {
+  const store = importDirectAccounts(
+    { version: 1, nextIndex: 0, accounts: [] },
+    [
+      { label: "disabled", accessToken: fakeJwt({ email: "off@example.com", sub: "off" }), refreshToken: "refresh-off", enabled: false },
+      { label: "one", accessToken: fakeJwt({ email: "one@example.com", sub: "one" }), refreshToken: "refresh-one" },
+      { label: "two", accessToken: fakeJwt({ email: "two@example.com", sub: "two" }), refreshToken: "refresh-two" },
+    ],
+    { now: 1000 },
+  ).store;
+
+  const first = selectDirectAccount(store, { now: 2000 });
+  const second = selectDirectAccount(first.store, { now: 3000 });
+  const third = selectDirectAccount(second.store, { now: 4000 });
+
+  assert.equal(first.account.label, "one");
+  assert.equal(second.account.label, "two");
+  assert.equal(third.account.label, "one");
+});
+
+test("selectDirectAccount can use a legacy auth file account when pool is empty", () => {
+  const legacy = createLegacyDirectAccount(
+    { accessToken: fakeJwt({ email: "legacy@example.com", sub: "legacy_sub" }), refreshToken: "legacy-refresh" },
+    { authPath: "/tmp/auth.json", now: 1000 },
+  );
+
+  const selected = selectDirectAccount({ version: 1, nextIndex: 0, accounts: [] }, { legacyAccount: legacy });
+
+  assert.equal(selected.account.id, "legacy-auth");
+  assert.equal(summarizeDirectAccount(selected.account).email, "legacy@example.com");
+});
+
+test("isDirectAdminAuthorized rejects missing admin password and accepts the configured header", () => {
+  assert.equal(isDirectAdminAuthorized({ headers: {} }, "secret"), false);
+  assert.equal(isDirectAdminAuthorized({ headers: { "x-admin-password": "secret" } }, "secret"), true);
+  assert.equal(isDirectAdminAuthorized({ headers: { authorization: "Bearer secret" } }, "secret"), true);
 });

@@ -3,6 +3,8 @@ set -euo pipefail
 
 sudo mkdir -p /opt/cursor-direct-gateway
 sudo install -o ubuntu -g ubuntu -m 0644 /tmp/cursor-direct-gateway.mjs /opt/cursor-direct-gateway/cursor-direct-gateway.mjs
+sudo install -o ubuntu -g ubuntu -m 0644 /tmp/direct-admin-page.mjs /opt/cursor-direct-gateway/direct-admin-page.mjs
+sudo install -o ubuntu -g ubuntu -m 0644 /tmp/admin-shared.mjs /opt/cursor-direct-gateway/admin-shared.mjs
 sudo install -o root -g root -m 0644 /tmp/cursor-direct-gateway.service /etc/systemd/system/cursor-direct-gateway.service
 
 key="$(sudo awk -F= '/^CURSOR_GATEWAY_API_KEY=/{print substr($0,index($0,$2)); exit}' /opt/cursor-gateway/cursor-gateway.env)"

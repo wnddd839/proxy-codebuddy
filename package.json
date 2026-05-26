@@ -1,7 +1,7 @@
 {
   "name": "@rama_nigg/open-cursor",
   "version": "2.4.6",
-  "description": "No prompt limits. No broken streams. Full thinking + tool support. Your Cursor subscription, properly integrated.",
+  "description": "Cursor OpenAI-compatible proxy gateway with Direct Gateway, account pool admin, NewAPI support, and OpenCode integration.",
   "type": "module",
   "main": "dist/plugin-entry.js",
   "module": "src/plugin-entry.ts",
@@ -58,11 +58,11 @@
   "license": "ISC",
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/Nomadcxx/opencode-cursor.git"
+    "url": "git+https://github.com/wnddd839/cursor-proxy.git"
   },
-  "homepage": "https://github.com/Nomadcxx/opencode-cursor#readme",
+  "homepage": "https://github.com/wnddd839/cursor-proxy#readme",
   "bugs": {
-    "url": "https://github.com/Nomadcxx/opencode-cursor/issues"
+    "url": "https://github.com/wnddd839/cursor-proxy/issues"
   },
   "keywords": [
     "opencode",

@@ -1,12 +1,14 @@
 #!/usr/bin/env node
 import { createServer } from "node:http";
 import http2 from "node:http2";
+import { spawn } from "node:child_process";
 import { existsSync, mkdirSync, readFileSync, unlinkSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import path from "node:path";
 import { createHash, randomUUID } from "node:crypto";
 import { pathToFileURL } from "node:url";
 import zlib from "node:zlib";
+import { buildDirectAdminHtml } from "./direct-admin-page.mjs";
 
 const DEFAULT_AUTH_PATH = path.join(homedir(), ".config", "cursor", "auth.json");
 
@@ -24,6 +26,9 @@ const config = {
     process.env.CURSOR_DIRECT_REQUIRE_API_KEY === "true" ||
     Boolean(process.env.CURSOR_DIRECT_API_KEY || process.env.CURSOR_GATEWAY_API_KEY),
   authPath: process.env.CURSOR_DIRECT_AUTH_PATH || DEFAULT_AUTH_PATH,
+  accountsPath:
+    process.env.CURSOR_DIRECT_ACCOUNTS_PATH ||
+    path.join(path.dirname(process.env.CURSOR_DIRECT_AUTH_PATH || DEFAULT_AUTH_PATH), "direct-accounts.json"),
   apiBaseUrl: process.env.CURSOR_DIRECT_API_BASE_URL || "https://api2.cursor.sh",
   agentHost: process.env.CURSOR_DIRECT_AGENT_HOST || "agentn.api5.cursor.sh",
   clientVersion: process.env.CURSOR_DIRECT_CLIENT_VERSION || "cli-2026.05.24-dda726e",
@@ -34,6 +39,9 @@ const config = {
 };
 
 const startedAt = Date.now();
+const OAUTH_URL_TIMEOUT_MS = 10000;
+const OAUTH_COMPLETE_TIMEOUT_MS = Number(process.env.CURSOR_DIRECT_OAUTH_TIMEOUT_MS || "180000");
+const OAUTH_POLL_INTERVAL_MS = 2000;
 const modelCache = { expiresAt: 0, models: [] };
 const stats = {
   totalRequests: 0,
@@ -103,7 +111,8 @@ async function refreshAuthIfNeeded(auth) {
 }
 
 async function getAccessToken() {
-  return refreshAuthIfNeeded(readAuthFile());
+  const selection = await selectAndRefreshDirectAccount();
+  return selection.account.accessToken;
 }
 
 function maskSecret(value, visible = 4) {
@@ -131,6 +140,606 @@ function summarizeCursorAuth(auth, options = {}) {
     hasRefreshToken: Boolean(refreshToken),
     accessTokenPreview: maskSecret(accessToken, 6),
     refreshTokenPreview: maskSecret(refreshToken, 6),
+  };
+}
+
+function createOAuthSessionState() {
+  return {
+    id: "",
+    status: "idle",
+    url: "",
+    callbackUrl: "",
+    startedAt: 0,
+    updatedAt: 0,
+    completedAt: 0,
+    exitCode: null,
+    pid: null,
+    error: "",
+    stdout: "",
+    stderr: "",
+    child: null,
+  };
+}
+
+let oauthSession = createOAuthSessionState();
+
+function normalizeDirectAccountAuth(input) {
+  const source = typeof input === "object" && input ? input : {};
+  return {
+    accessToken: String(source.accessToken || source.access_token || ""),
+    refreshToken: String(source.refreshToken || source.refresh_token || ""),
+  };
+}
+
+function createEmptyAccountsStore() {
+  return { version: 1, nextIndex: 0, accounts: [] };
+}
+
+function normalizeStoredDirectAccount(raw) {
+  if (!raw || typeof raw !== "object") return null;
+  const { accessToken, refreshToken } = normalizeDirectAccountAuth(raw);
+  if (!accessToken) return null;
+  const payload = getJwtPayload(accessToken);
+  const email = raw.email || raw.userEmail || payload.email || payload.userEmail || "";
+  const subject = raw.subject || payload.sub || payload.subject || "";
+  const now = Date.now();
+  return {
+    id: String(raw.id || createHash("sha256").update(`${subject}|${email}|${refreshToken}`).digest("hex").slice(0, 16)),
+    label: String(raw.label || email || subject || "Cursor account"),
+    email: String(email || ""),
+    subject: String(subject || ""),
+    enabled: raw.enabled !== false,
+    source: String(raw.source || "pool"),
+    authPath: raw.authPath || "",
+    accessToken,
+    refreshToken,
+    accessTokenExpiresAt: Number(raw.accessTokenExpiresAt || getJwtExpMs(accessToken) || 0),
+    createdAt: Number(raw.createdAt || now),
+    updatedAt: Number(raw.updatedAt || now),
+    lastUsedAt: Number(raw.lastUsedAt || 0),
+    lastSelectedAt: Number(raw.lastSelectedAt || 0),
+    successRequests: Number(raw.successRequests || 0),
+    failedRequests: Number(raw.failedRequests || 0),
+    lastError: String(raw.lastError || ""),
+  };
+}
+
+function normalizeAccountsStore(store) {
+  const input = store && typeof store === "object" ? store : createEmptyAccountsStore();
+  const accounts = (Array.isArray(input.accounts) ? input.accounts : [])
+    .map(normalizeStoredDirectAccount)
+    .filter(Boolean);
+  const rawNext = Number.isInteger(input.nextIndex) ? input.nextIndex : 0;
+  const nextIndex = accounts.length > 0 ? ((rawNext % accounts.length) + accounts.length) % accounts.length : 0;
+  return { version: 1, nextIndex, accounts };
+}
+
+function readAccountsStore() {
+  if (!existsSync(config.accountsPath)) return createEmptyAccountsStore();
+  return normalizeAccountsStore(JSON.parse(readFileSync(config.accountsPath, "utf8")));
+}
+
+function writeAccountsStore(store) {
+  const normalized = normalizeAccountsStore(store);
+  mkdirSync(path.dirname(config.accountsPath), { recursive: true });
+  writeFileSync(config.accountsPath, `${JSON.stringify(normalized, null, 2)}\n`, { mode: 0o600 });
+  return normalized;
+}
+
+function createDirectAccount(auth, options = {}) {
+  const now = Number(options.now || Date.now());
+  const { accessToken, refreshToken } = normalizeDirectAccountAuth(auth);
+  if (!accessToken || !refreshToken) {
+    throw new Error("auth.json must include accessToken and refreshToken");
+  }
+  const payload = getJwtPayload(accessToken);
+  const email = auth?.email || auth?.userEmail || payload.email || payload.userEmail || "";
+  const subject = auth?.subject || payload.sub || payload.subject || "";
+  const id = String(
+    options.id ||
+    auth?.id ||
+    createHash("sha256").update(`${subject}|${email}|${refreshToken}`).digest("hex").slice(0, 16),
+  );
+  return {
+    id,
+    label: String(options.label || auth?.label || email || subject || `Cursor ${id.slice(0, 6)}`),
+    email: String(email || ""),
+    subject: String(subject || ""),
+    enabled: auth?.enabled !== false && options.enabled !== false,
+    source: String(options.source || auth?.source || "pool"),
+    authPath: String(options.authPath || auth?.authPath || ""),
+    accessToken,
+    refreshToken,
+    accessTokenExpiresAt: getJwtExpMs(accessToken),
+    createdAt: Number(auth?.createdAt || now),
+    updatedAt: now,
+    lastUsedAt: Number(auth?.lastUsedAt || 0),
+    lastSelectedAt: Number(auth?.lastSelectedAt || 0),
+    successRequests: Number(auth?.successRequests || 0),
+    failedRequests: Number(auth?.failedRequests || 0),
+    lastError: String(auth?.lastError || ""),
+  };
+}
+
+function createLegacyDirectAccount(auth, options = {}) {
+  return createDirectAccount(auth, {
+    ...options,
+    id: "legacy-auth",
+    label: options.label || "Legacy auth.json",
+    source: "legacy",
+    authPath: options.authPath || config.authPath,
+  });
+}
+
+function summarizeDirectAccount(account) {
+  const summary = summarizeCursorAuth(account, { authPath: account?.authPath || config.accountsPath });
+  return {
+    id: account?.id || "",
+    label: account?.label || "",
+    enabled: account?.enabled !== false,
+    source: account?.source || "pool",
+    loggedIn: summary.loggedIn,
+    email: account?.email || summary.email || "",
+    subject: account?.subject || summary.subject || "",
+    authPath: account?.authPath || "",
+    issuedAt: summary.issuedAt,
+    accessTokenExpiresAt: Number(account?.accessTokenExpiresAt || summary.accessTokenExpiresAt || 0),
+    hasRefreshToken: summary.hasRefreshToken,
+    accessTokenPreview: summary.accessTokenPreview,
+    refreshTokenPreview: summary.refreshTokenPreview,
+    createdAt: Number(account?.createdAt || 0),
+    updatedAt: Number(account?.updatedAt || 0),
+    lastUsedAt: Number(account?.lastUsedAt || 0),
+    lastSelectedAt: Number(account?.lastSelectedAt || 0),
+    successRequests: Number(account?.successRequests || 0),
+    failedRequests: Number(account?.failedRequests || 0),
+    lastError: String(account?.lastError || ""),
+  };
+}
+
+function summarizeAccountsStore(store, options = {}) {
+  const normalized = normalizeAccountsStore(store);
+  const accounts = normalized.accounts.map(summarizeDirectAccount);
+  const enabledAccounts = accounts.filter((account) => account.enabled);
+  const primary = enabledAccounts[0] || accounts[0] || options.legacyAccount || null;
+  return {
+    ok: true,
+    version: normalized.version,
+    nextIndex: normalized.nextIndex,
+    accountsPath: config.accountsPath,
+    count: accounts.length,
+    enabledCount: enabledAccounts.length,
+    disabledCount: accounts.length - enabledAccounts.length,
+    loggedIn: Boolean(primary?.loggedIn),
+    primary: primary || null,
+    accounts,
+    legacy: options.legacyAccount || null,
+    ...(primary || {}),
+  };
+}
+
+function parseAccountsImportInput(input) {
+  if (typeof input === "string") {
+    const text = input.trim();
+    if (!text) return [];
+    return parseAccountsImportInput(JSON.parse(text));
+  }
+  if (Array.isArray(input)) return input.flatMap(parseAccountsImportInput);
+  if (!input || typeof input !== "object") return [];
+  if (typeof input.authJson === "string") {
+    return parseAccountsImportInput(input.authJson).map((account) => ({
+      ...account,
+      label: input.label || account.label,
+      enabled: typeof input.enabled === "boolean" ? input.enabled : account.enabled,
+    }));
+  }
+  if (Array.isArray(input.accounts)) return input.accounts.flatMap(parseAccountsImportInput);
+  return [input];
+}
+
+function importDirectAccounts(store, input, options = {}) {
+  const now = Number(options.now || Date.now());
+  const nextStore = normalizeAccountsStore(store);
+  const inputs = parseAccountsImportInput(input);
+  const imported = [];
+
+  for (const raw of inputs) {
+    const account = createDirectAccount(raw, { now });
+    const existingIndex = nextStore.accounts.findIndex((item) => (
+      item.id === account.id ||
+      (account.subject && item.subject === account.subject) ||
+      (account.email && item.email === account.email)
+    ));
+    if (existingIndex >= 0) {
+      const previous = nextStore.accounts[existingIndex];
+      nextStore.accounts[existingIndex] = {
+        ...previous,
+        ...account,
+        id: previous.id,
+        createdAt: previous.createdAt || account.createdAt,
+        successRequests: previous.successRequests || 0,
+        failedRequests: previous.failedRequests || 0,
+        lastUsedAt: previous.lastUsedAt || 0,
+        lastSelectedAt: previous.lastSelectedAt || 0,
+        lastError: "",
+      };
+      imported.push(nextStore.accounts[existingIndex]);
+    } else {
+      nextStore.accounts.push(account);
+      imported.push(account);
+    }
+  }
+
+  return {
+    store: normalizeAccountsStore(nextStore),
+    imported,
+    summaries: imported.map(summarizeDirectAccount),
+  };
+}
+
+function selectDirectAccount(store, options = {}) {
+  const normalized = normalizeAccountsStore(store);
+  const now = Number(options.now || Date.now());
+  const accountId = options.accountId ? String(options.accountId) : "";
+
+  if (accountId) {
+    const selectedIndex = normalized.accounts.findIndex((account) => account.id === accountId);
+    if (selectedIndex < 0) throw new Error(`Cursor direct account not found: ${accountId}`);
+    const selected = normalized.accounts[selectedIndex];
+    if (selected.enabled === false) throw new Error(`Cursor direct account is disabled: ${accountId}`);
+    const nextAccounts = normalized.accounts.slice();
+    nextAccounts[selectedIndex] = { ...selected, lastSelectedAt: now };
+    return {
+      account: nextAccounts[selectedIndex],
+      store: { ...normalized, accounts: nextAccounts },
+      index: selectedIndex,
+      source: "pool",
+    };
+  }
+
+  if (normalized.accounts.length > 0) {
+    for (let offset = 0; offset < normalized.accounts.length; offset += 1) {
+      const selectedIndex = (normalized.nextIndex + offset) % normalized.accounts.length;
+      const selected = normalized.accounts[selectedIndex];
+      if (!selected || selected.enabled === false || !selected.accessToken) continue;
+      const nextAccounts = normalized.accounts.slice();
+      nextAccounts[selectedIndex] = { ...selected, lastSelectedAt: now };
+      return {
+        account: nextAccounts[selectedIndex],
+        store: {
+          ...normalized,
+          nextIndex: (selectedIndex + 1) % normalized.accounts.length,
+          accounts: nextAccounts,
+        },
+        index: selectedIndex,
+        source: "pool",
+      };
+    }
+  }
+
+  if (options.legacyAccount?.accessToken) {
+    return {
+      account: options.legacyAccount,
+      store: normalized,
+      index: -1,
+      source: "legacy",
+    };
+  }
+
+  throw new Error("No enabled Cursor direct accounts available");
+}
+
+function readLegacyDirectAccount() {
+  try {
+    return createLegacyDirectAccount(readAuthFile(), { authPath: config.authPath });
+  } catch {
+    return null;
+  }
+}
+
+function updateStoredDirectAccount(accountId, updater) {
+  const store = readAccountsStore();
+  const index = store.accounts.findIndex((account) => account.id === accountId);
+  if (index < 0) return null;
+  const accounts = store.accounts.slice();
+  accounts[index] = normalizeStoredDirectAccount(updater(accounts[index]));
+  writeAccountsStore({ ...store, accounts });
+  return accounts[index];
+}
+
+async function refreshDirectAccount(account, options = {}) {
+  const result = await refreshAuthRecord(account, {
+    force: options.force,
+    write: account?.source === "legacy",
+    authPath: account?.authPath || config.authPath,
+  });
+  return {
+    ...account,
+    accessToken: result.accessToken,
+    refreshToken: result.refreshToken,
+    accessTokenExpiresAt: getJwtExpMs(result.accessToken),
+    updatedAt: result.refreshed ? Date.now() : account.updatedAt,
+    refreshed: Boolean(result.refreshed),
+  };
+}
+
+async function selectAndRefreshDirectAccount(options = {}) {
+  const store = readAccountsStore();
+  const selected = selectDirectAccount(store, {
+    accountId: options.accountId,
+    legacyAccount: readLegacyDirectAccount(),
+  });
+  if (selected.source === "pool") {
+    let nextStore = writeAccountsStore(selected.store);
+    const refreshed = await refreshDirectAccount(selected.account, { force: options.force });
+    if (refreshed.refreshed) {
+      const accounts = nextStore.accounts.slice();
+      accounts[selected.index] = normalizeStoredDirectAccount(refreshed);
+      nextStore = writeAccountsStore({ ...nextStore, accounts });
+      modelCache.expiresAt = 0;
+      modelCache.models = [];
+    }
+    return { ...selected, account: refreshed, store: nextStore };
+  }
+
+  const refreshed = await refreshDirectAccount(selected.account, { force: options.force });
+  return { ...selected, account: refreshed };
+}
+
+function markDirectAccountResult(selection, ok, details = {}) {
+  if (!selection || selection.source !== "pool" || !selection.account?.id) return;
+  updateStoredDirectAccount(selection.account.id, (account) => ({
+    ...account,
+    lastUsedAt: Date.now(),
+    successRequests: Number(account.successRequests || 0) + (ok ? 1 : 0),
+    failedRequests: Number(account.failedRequests || 0) + (ok ? 0 : 1),
+    lastError: ok ? "" : String(details.error || "unknown error").slice(0, 600),
+  }));
+}
+
+function resolveCursorAgentBinary() {
+  if (process.env.CURSOR_AGENT_PATH) return process.env.CURSOR_AGENT_PATH;
+  if (process.platform === "win32") {
+    const localAppData = process.env.LOCALAPPDATA || "";
+    const knownPath = path.join(localAppData, "cursor-agent", "cursor-agent.cmd");
+    if (knownPath && existsSync(knownPath)) return knownPath;
+    return "cursor-agent.cmd";
+  }
+
+  const candidates = [
+    path.join(homedir(), ".cursor-agent", "cursor-agent"),
+    "/usr/local/bin/cursor-agent",
+    "/usr/bin/cursor-agent",
+  ];
+  for (const candidate of candidates) {
+    if (existsSync(candidate)) return candidate;
+  }
+  return "cursor-agent";
+}
+
+function stripAnsi(value) {
+  return String(value ?? "").replace(/\x1b\[[0-9;]*[a-zA-Z]/g, "");
+}
+
+function extractCursorLoginUrl(output) {
+  const compact = stripAnsi(output).replace(/\s+/g, "");
+  const match = compact.match(/https:\/\/cursor\.com\/loginDeepControl(?:\?[A-Za-z0-9._~%=&-]*)?/);
+  return match ? match[0] : "";
+}
+
+function getOAuthSessionSnapshot() {
+  return {
+    id: oauthSession.id,
+    status: oauthSession.status,
+    url: oauthSession.url,
+    callbackUrl: oauthSession.callbackUrl,
+    startedAt: oauthSession.startedAt,
+    updatedAt: oauthSession.updatedAt,
+    completedAt: oauthSession.completedAt,
+    exitCode: oauthSession.exitCode,
+    pid: oauthSession.pid,
+    error: oauthSession.error,
+    running: Boolean(oauthSession.child && oauthSession.child.exitCode === null),
+  };
+}
+
+function sleep(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+function stopDirectOAuthSession(reason = "idle") {
+  if (oauthSession.child && oauthSession.child.exitCode === null) {
+    try {
+      oauthSession.child.kill("SIGTERM");
+    } catch {
+      // ignore
+    }
+  }
+  oauthSession = createOAuthSessionState();
+  oauthSession.status = reason;
+}
+
+function importCurrentAuthFileToPool(options = {}) {
+  const auth = readAuthFile();
+  const store = readAccountsStore();
+  const result = importDirectAccounts(store, {
+    ...auth,
+    label: options.label || "OAuth account",
+    source: "oauth",
+    authPath: config.authPath,
+  });
+  const nextStore = writeAccountsStore(result.store);
+  modelCache.expiresAt = 0;
+  modelCache.models = [];
+  return {
+    ok: true,
+    accounts: summarizeAccountsStore(nextStore),
+    imported: result.summaries,
+  };
+}
+
+async function startDirectOAuthSession() {
+  if (oauthSession.child && oauthSession.child.exitCode === null) {
+    return {
+      reused: true,
+      session: getOAuthSessionSnapshot(),
+      accounts: summarizeAccountsStore(readAccountsStore()),
+    };
+  }
+
+  oauthSession = createOAuthSessionState();
+  oauthSession.id = `${Date.now()}-${Math.random().toString(16).slice(2)}`;
+  oauthSession.status = "starting";
+  oauthSession.startedAt = Date.now();
+  oauthSession.updatedAt = oauthSession.startedAt;
+  const sessionId = oauthSession.id;
+
+  const child = spawn(resolveCursorAgentBinary(), ["login"], {
+    stdio: ["pipe", "pipe", "pipe"],
+    env: { ...process.env, NO_OPEN_BROWSER: "1" },
+    shell: process.platform === "win32",
+  });
+
+  oauthSession.child = child;
+  oauthSession.pid = child.pid || null;
+
+  return new Promise((resolve, reject) => {
+    let settled = false;
+    const settle = (fn, value) => {
+      if (settled) return;
+      settled = true;
+      fn(value);
+    };
+
+    const tryExtractUrl = () => {
+      if (oauthSession.id !== sessionId) return;
+      const url = extractCursorLoginUrl(`${oauthSession.stdout}\n${oauthSession.stderr}`);
+      if (!url) return;
+      oauthSession.url = url;
+      oauthSession.status = "waiting";
+      oauthSession.updatedAt = Date.now();
+      settle(resolve, {
+        reused: false,
+        session: getOAuthSessionSnapshot(),
+        accounts: summarizeAccountsStore(readAccountsStore()),
+      });
+    };
+
+    child.stdout.on("data", (chunk) => {
+      if (oauthSession.id !== sessionId) return;
+      oauthSession.stdout += chunk.toString();
+      oauthSession.updatedAt = Date.now();
+      tryExtractUrl();
+    });
+
+    child.stderr.on("data", (chunk) => {
+      if (oauthSession.id !== sessionId) return;
+      oauthSession.stderr += chunk.toString();
+      oauthSession.updatedAt = Date.now();
+      tryExtractUrl();
+    });
+
+    child.on("error", (error) => {
+      if (oauthSession.id !== sessionId) {
+        settle(reject, new Error("Cursor OAuth session was replaced"));
+        return;
+      }
+      oauthSession.status = "failed";
+      oauthSession.error = error instanceof Error ? error.message : String(error);
+      oauthSession.updatedAt = Date.now();
+      settle(reject, error);
+    });
+
+    child.on("close", (code) => {
+      if (oauthSession.id !== sessionId) {
+        settle(reject, new Error("Cursor OAuth session was replaced"));
+        return;
+      }
+      oauthSession.exitCode = code;
+      oauthSession.child = null;
+      oauthSession.updatedAt = Date.now();
+      try {
+        const imported = importCurrentAuthFileToPool({ label: "OAuth account" });
+        oauthSession.status = "complete";
+        oauthSession.completedAt = Date.now();
+        oauthSession.error = "";
+        settle(resolve, {
+          ...imported,
+          session: getOAuthSessionSnapshot(),
+        });
+      } catch {
+        if (oauthSession.status !== "waiting") {
+          oauthSession.status = "failed";
+          oauthSession.error = stripAnsi(oauthSession.stderr).trim()
+            || stripAnsi(oauthSession.stdout).trim()
+            || `cursor-agent login exited with code ${String(code ?? "unknown")}`;
+          settle(reject, new Error(oauthSession.error));
+        }
+      }
+    });
+
+    setTimeout(() => {
+      if (oauthSession.id !== sessionId || settled) return;
+      oauthSession.status = "failed";
+      oauthSession.error = "生成 Cursor 授权链接超时";
+      oauthSession.updatedAt = Date.now();
+      if (child.exitCode === null) {
+        try {
+          child.kill("SIGTERM");
+        } catch {
+          // ignore
+        }
+      }
+      settle(reject, new Error(oauthSession.error));
+    }, OAUTH_URL_TIMEOUT_MS);
+  });
+}
+
+async function waitForDirectOAuthCompletion(callbackUrl = "") {
+  if (callbackUrl) {
+    oauthSession.callbackUrl = String(callbackUrl).trim();
+    oauthSession.updatedAt = Date.now();
+    if (oauthSession.child?.stdin?.writable) {
+      try {
+        oauthSession.child.stdin.write(`${oauthSession.callbackUrl}\n`);
+      } catch {
+        // Cursor usually completes through browser callback; stdin is best effort.
+      }
+    }
+  }
+
+  const start = Date.now();
+  while (Date.now() - start < OAUTH_COMPLETE_TIMEOUT_MS) {
+    try {
+      const imported = importCurrentAuthFileToPool({ label: "OAuth account" });
+      oauthSession.status = "complete";
+      oauthSession.completedAt = Date.now();
+      oauthSession.error = "";
+      oauthSession.updatedAt = Date.now();
+      return {
+        ...imported,
+        session: getOAuthSessionSnapshot(),
+      };
+    } catch {
+      if (oauthSession.exitCode !== null && oauthSession.exitCode !== 0) {
+        oauthSession.status = "failed";
+        oauthSession.error ||= "Cursor 登录进程已退出，认证未完成";
+        break;
+      }
+      await sleep(OAUTH_POLL_INTERVAL_MS);
+    }
+  }
+
+  if (oauthSession.status !== "failed") {
+    oauthSession.status = "waiting";
+    oauthSession.error = "尚未检测到 Cursor 登录态，请完成浏览器授权后重试";
+    oauthSession.updatedAt = Date.now();
+  }
+
+  return {
+    ok: false,
+    session: getOAuthSessionSnapshot(),
+    accounts: summarizeAccountsStore(readAccountsStore()),
   };
 }
 
@@ -163,33 +772,29 @@ async function refreshAuthRecord(auth, options = {}) {
     return { ...current, refreshed: false };
   }
 
-  writeFileSync(config.authPath, `${JSON.stringify(next, null, 2)}\n`, { mode: 0o600 });
+  if (options.write !== false) {
+    const targetPath = options.authPath || config.authPath;
+    mkdirSync(path.dirname(targetPath), { recursive: true });
+    writeFileSync(targetPath, `${JSON.stringify(next, null, 2)}\n`, { mode: 0o600 });
+  }
   return { accessToken: next.accessToken, refreshToken: next.refreshToken, refreshed: true };
 }
 
 async function readAndSummarizeAuth() {
-  if (!existsSync(config.authPath)) {
-    return {
-      loggedIn: false,
-      authPath: config.authPath,
-      email: "",
-      subject: "",
-      issuedAt: 0,
-      accessTokenExpiresAt: 0,
-      hasRefreshToken: false,
-      accessTokenPreview: "",
-      refreshTokenPreview: "",
-      missing: true,
-    };
-  }
-
-  const auth = JSON.parse(readFileSync(config.authPath, "utf8"));
-  return summarizeCursorAuth(auth, { authPath: config.authPath });
+  const store = readAccountsStore();
+  const legacy = readLegacyDirectAccount();
+  return summarizeAccountsStore(store, { legacyAccount: legacy ? summarizeDirectAccount(legacy) : null });
 }
 
 function clearAuthFile() {
   if (existsSync(config.authPath)) {
     unlinkSync(config.authPath);
+  }
+}
+
+function clearAccountsStore() {
+  if (existsSync(config.accountsPath)) {
+    unlinkSync(config.accountsPath);
   }
 }
 
@@ -240,7 +845,7 @@ async function listDirectModels(options = {}) {
     return modelCache.models;
   }
 
-  const token = await getAccessToken();
+  const token = options.accessToken || options.account?.accessToken || await getAccessToken();
   const response = await fetch(`${config.apiBaseUrl}/aiserver.v1.AiService/GetUsableModels`, {
     method: "POST",
     headers: cursorHeaders(token, {
@@ -514,11 +1119,11 @@ function buildPromptFromMessages(messages) {
   return lines.join("\n\n").trim() || "Hello";
 }
 
-function runDirectCompletion(prompt, model) {
+function runDirectCompletion(prompt, model, options = {}) {
   return new Promise(async (resolve, reject) => {
     let token;
     try {
-      token = await getAccessToken();
+      token = options.accessToken || options.account?.accessToken || await getAccessToken();
     } catch (error) {
       reject(error);
       return;
@@ -618,6 +1223,22 @@ function runDirectCompletion(prompt, model) {
   });
 }
 
+async function runDirectCompletionFromPool(prompt, model, options = {}) {
+  const selection = await selectAndRefreshDirectAccount({ accountId: options.accountId });
+  try {
+    const result = await runDirectCompletion(prompt, model, { accessToken: selection.account.accessToken });
+    markDirectAccountResult(selection, true, { outputChars: result.text.length });
+    return {
+      ...result,
+      account: summarizeDirectAccount(selection.account),
+      accountId: selection.account.id,
+    };
+  } catch (error) {
+    markDirectAccountResult(selection, false, { error: error instanceof Error ? error.message : String(error) });
+    throw error;
+  }
+}
+
 function beginTrackedRequest(model, promptChars) {
   const started = Date.now();
   stats.totalRequests += 1;
@@ -692,7 +1313,7 @@ function html(status, body) {
       "content-type": "text/html; charset=utf-8",
       "access-control-allow-origin": "*",
       "access-control-allow-headers": "authorization,content-type,x-api-key,x-admin-password",
-      "access-control-allow-methods": "GET,POST,OPTIONS",
+      "access-control-allow-methods": "GET,POST,DELETE,OPTIONS",
     },
     body,
   };
@@ -705,7 +1326,7 @@ function json(status, payload) {
       "content-type": "application/json; charset=utf-8",
       "access-control-allow-origin": "*",
       "access-control-allow-headers": "authorization,content-type,x-api-key,x-admin-password",
-      "access-control-allow-methods": "GET,POST,OPTIONS",
+      "access-control-allow-methods": "GET,POST,DELETE,OPTIONS",
     },
     body: JSON.stringify(payload),
   };
@@ -730,12 +1351,16 @@ function isAuthorized(req) {
   return bearer === config.apiKey || apiKey === config.apiKey;
 }
 
-function isAdminAuthorized(req) {
-  if (!config.adminPassword) return false;
+function isDirectAdminAuthorized(req, adminPassword = config.adminPassword) {
+  if (!adminPassword) return false;
   const auth = req.headers.authorization || "";
   const bearer = auth.toLowerCase().startsWith("bearer ") ? auth.slice(7).trim() : "";
   const password = req.headers["x-admin-password"] || "";
-  return bearer === config.adminPassword || password === config.adminPassword;
+  return bearer === adminPassword || password === adminPassword;
+}
+
+function isAdminAuthorized(req) {
+  return isDirectAdminAuthorized(req);
 }
 
 function getMemorySnapshot() {
@@ -756,6 +1381,7 @@ function getStatusPayload() {
     backend: "agent-service-run",
     authRequired: config.requireApiKey,
     authPath: config.authPath,
+    accountsPath: config.accountsPath,
     agentHost: config.agentHost,
     clientVersion: config.clientVersion,
     uptimeMs: Date.now() - startedAt,
@@ -782,6 +1408,7 @@ function buildDirectAdminStatusPayload() {
       host: config.host,
       port: config.port,
       authPath: config.authPath,
+      accountsPath: config.accountsPath,
       agentHost: config.agentHost,
       clientVersion: config.clientVersion,
       idleMs: config.idleMs,
@@ -791,461 +1418,6 @@ function buildDirectAdminStatusPayload() {
   };
 }
 
-function buildDirectAdminHtml() {
-  return `<!doctype html>
-<html lang="zh-CN">
-<head>
-  <meta charset="utf-8" />
-  <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <title>Cursor Direct Gateway</title>
-  <style>
-    :root {
-      --bg: #0d1110;
-      --panel: #151a18;
-      --panel-2: #1c2320;
-      --line: #2c3833;
-      --text: #edf4ef;
-      --muted: #a7b4ad;
-      --faint: #74837b;
-      --accent: #7fd889;
-      --accent-2: #67c7d8;
-      --warn: #f4c35d;
-      --bad: #f07b86;
-      --ink: #0b100e;
-    }
-    * { box-sizing: border-box; }
-    html, body { margin: 0; min-height: 100%; background: var(--bg); color: var(--text); font: 14px/1.5 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; letter-spacing: 0; }
-    body {
-      background:
-        linear-gradient(180deg, rgba(127,216,137,.08), transparent 280px),
-        linear-gradient(135deg, #0b0f0e 0%, #111816 54%, #0c1212 100%);
-    }
-    body::before {
-      content: ""; position: fixed; inset: 0; pointer-events: none; opacity: .14;
-      background-image: linear-gradient(rgba(255,255,255,.06) 1px, transparent 1px), linear-gradient(90deg, rgba(255,255,255,.05) 1px, transparent 1px);
-      background-size: 24px 24px;
-    }
-    button, input, textarea, select { font: inherit; letter-spacing: 0; }
-    button {
-      min-height: 38px; border: 1px solid var(--line); border-radius: 8px; padding: 9px 12px;
-      background: #202822; color: var(--text); cursor: pointer;
-    }
-    button:hover { border-color: #4a6258; }
-    button.primary { background: var(--accent); border-color: #a1efaa; color: var(--ink); font-weight: 800; }
-    button.warn { background: #332916; border-color: rgba(244,195,93,.45); color: #ffe4a1; }
-    button.danger { background: #321b20; border-color: rgba(240,123,134,.45); color: #ffc2c8; }
-    input, textarea, select {
-      width: 100%; border: 1px solid var(--line); border-radius: 8px; color: var(--text);
-      background: #0f1513; padding: 10px 11px; outline: none;
-    }
-    textarea { min-height: 170px; resize: vertical; }
-    label { display: block; color: var(--muted); font-size: 12px; margin-bottom: 7px; }
-    .hidden { display: none !important; }
-    .shell { position: relative; max-width: 1420px; margin: 0 auto; padding: 22px; }
-    .topbar, .panel, .login, .metric {
-      border: 1px solid var(--line); background: rgba(21,26,24,.92); border-radius: 8px;
-      box-shadow: 0 18px 45px rgba(0,0,0,.28);
-    }
-    .topbar { display: flex; align-items: center; justify-content: space-between; gap: 14px; padding: 16px; }
-    .brand { display: flex; align-items: center; gap: 12px; min-width: 0; }
-    .mark { width: 40px; height: 40px; border-radius: 8px; background: var(--accent); color: var(--ink); display: grid; place-items: center; font-weight: 900; }
-    .title { font-size: 18px; font-weight: 850; line-height: 1.2; }
-    .sub { color: var(--muted); font-size: 12px; margin-top: 3px; overflow-wrap: anywhere; }
-    .actions, .row { display: flex; gap: 8px; flex-wrap: wrap; align-items: center; }
-    .layout { display: grid; grid-template-columns: 300px minmax(0, 1fr); gap: 16px; margin-top: 16px; }
-    .rail { display: grid; gap: 12px; align-content: start; }
-    .panel { padding: 16px; }
-    .panel h2 { margin: 0 0 12px; font-size: 15px; line-height: 1.25; }
-    .metric-grid { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 12px; }
-    .metric { padding: 14px; min-height: 104px; }
-    .metric .label { color: var(--muted); font-size: 11px; text-transform: uppercase; }
-    .metric .value { margin-top: 9px; font-size: 26px; line-height: 1.05; font-weight: 900; overflow-wrap: anywhere; }
-    .metric .hint { margin-top: 8px; color: var(--faint); font-size: 12px; }
-    .grid { display: grid; gap: 16px; }
-    .split { display: grid; grid-template-columns: minmax(0, 1.15fr) minmax(320px, .85fr); gap: 14px; }
-    .stack { display: grid; gap: 12px; }
-    .mono {
-      border: 1px solid var(--line); border-radius: 8px; background: #0f1513; color: var(--muted);
-      padding: 12px; white-space: pre-wrap; overflow: auto; min-height: 86px;
-    }
-    .table { width: 100%; border-collapse: collapse; }
-    .table th, .table td { text-align: left; padding: 10px 8px; border-bottom: 1px solid var(--line); vertical-align: top; }
-    .table th { color: var(--muted); font-size: 11px; text-transform: uppercase; }
-    .pill { display: inline-flex; align-items: center; gap: 6px; border: 1px solid var(--line); border-radius: 999px; padding: 5px 8px; color: var(--muted); background: #101614; font-size: 12px; }
-    .pill.good { color: var(--accent); border-color: rgba(127,216,137,.42); }
-    .pill.warn { color: var(--warn); border-color: rgba(244,195,93,.42); }
-    .pill.bad { color: var(--bad); border-color: rgba(240,123,134,.42); }
-    .copyline { display: flex; gap: 8px; }
-    .copyline input { min-width: 0; }
-    .login-wrap { min-height: 100vh; display: grid; place-items: center; padding: 22px; }
-    .login { width: min(560px, 100%); padding: 20px; }
-    .login p { color: var(--muted); margin: 10px 0 18px; }
-    .toast { color: var(--muted); font-size: 12px; min-height: 18px; }
-    @media (max-width: 1100px) {
-      .layout, .split { grid-template-columns: 1fr; }
-      .metric-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
-    }
-    @media (max-width: 640px) {
-      .shell { padding: 12px; }
-      .topbar { align-items: flex-start; flex-direction: column; }
-      .metric-grid { grid-template-columns: 1fr; }
-      .copyline { display: grid; }
-      .metric .value { font-size: 22px; }
-    }
-  </style>
-</head>
-<body>
-  <div class="login-wrap" id="loginView">
-    <section class="login">
-      <div class="brand">
-        <div class="mark">CD</div>
-        <div>
-          <div class="title">Cursor Direct Gateway</div>
-          <div class="sub">直连模式管理台 · /direct-admin/</div>
-        </div>
-      </div>
-      <p>输入直连管理密码后，可以查看账号、导入 auth.json、刷新 token、检测模型和复制 NewAPI 接入地址。</p>
-      <label for="adminPassword">管理密码</label>
-      <input id="adminPassword" type="password" autocomplete="current-password" placeholder="输入管理密码" />
-      <div class="row" style="margin-top: 12px;">
-        <button class="primary" id="loginBtn">进入管理台</button>
-        <button id="rememberBtn" type="button">记住本浏览器</button>
-      </div>
-      <div class="toast" id="loginStatus" style="margin-top: 12px;">等待输入管理密码。</div>
-    </section>
-  </div>
-
-  <main class="shell hidden" id="appView">
-    <header class="topbar">
-      <div class="brand">
-        <div class="mark">CD</div>
-        <div>
-          <div class="title">Cursor Direct Gateway</div>
-          <div class="sub" id="runtimeLine">正在读取运行状态...</div>
-        </div>
-      </div>
-      <div class="actions">
-        <button class="primary" id="refreshBtn">刷新</button>
-        <button id="copyBaseBtn">复制 Base URL</button>
-        <button id="logoutAdminBtn">退出</button>
-      </div>
-    </header>
-
-    <section class="metric-grid" style="margin-top: 16px;">
-      <div class="metric">
-        <div class="label">账号</div>
-        <div class="value" id="accountValue">-</div>
-        <div class="hint" id="accountHint">等待读取</div>
-      </div>
-      <div class="metric">
-        <div class="label">NewAPI Base URL</div>
-        <div class="value" id="baseUrlValue">-</div>
-        <div class="hint">渠道类型选 OpenAI 兼容</div>
-      </div>
-      <div class="metric">
-        <div class="label">请求</div>
-        <div class="value" id="requestsValue">0</div>
-        <div class="hint" id="requestsHint">成功 / 失败</div>
-      </div>
-      <div class="metric">
-        <div class="label">延迟</div>
-        <div class="value" id="latencyValue">-</div>
-        <div class="hint" id="latencyHint">最近 / 平均</div>
-      </div>
-    </section>
-
-    <div class="layout">
-      <aside class="rail">
-        <section class="panel">
-          <h2>服务概览</h2>
-          <div class="stack">
-            <span class="pill good" id="healthPill">健康检查中</span>
-            <span class="pill" id="authPill">认证状态读取中</span>
-            <span class="pill" id="memoryPill">内存读取中</span>
-            <span class="pill" id="modelPill">模型读取中</span>
-          </div>
-        </section>
-        <section class="panel">
-          <h2>接入地址</h2>
-          <div class="copyline">
-            <input id="baseUrlInput" readonly />
-            <button id="copyBaseInlineBtn">复制</button>
-          </div>
-          <div class="mono" id="apiBox" style="margin-top: 12px;"></div>
-        </section>
-      </aside>
-
-      <section class="grid">
-        <section class="panel">
-          <h2>账号池</h2>
-          <table class="table">
-            <thead><tr><th>状态</th><th>账号</th><th>Token</th><th>文件</th></tr></thead>
-            <tbody id="accountRows"><tr><td colspan="4">正在读取...</td></tr></tbody>
-          </table>
-        </section>
-
-        <section class="split">
-          <div class="panel">
-            <h2>导入 / 更新账号</h2>
-            <label for="authJson">Cursor auth.json</label>
-            <textarea id="authJson" placeholder='粘贴包含 accessToken 和 refreshToken 的 JSON'></textarea>
-            <div class="row" style="margin-top: 10px;">
-              <button class="primary" id="saveAuthBtn">保存账号</button>
-              <button class="warn" id="refreshTokenBtn">强制刷新 Token</button>
-              <button class="danger" id="clearAuthBtn">清除账号</button>
-            </div>
-            <div class="toast" id="authToast" style="margin-top: 10px;"></div>
-          </div>
-          <div class="panel">
-            <h2>运行诊断</h2>
-            <label for="probeModel">探针模型</label>
-            <select id="probeModel"><option value="composer-2-fast">composer-2-fast</option><option value="auto">auto</option></select>
-            <div class="row" style="margin-top: 10px;">
-              <button class="primary" id="probeBtn">运行探针</button>
-            </div>
-            <div class="mono" id="probeBox" style="margin-top: 12px;">还没有运行探针。</div>
-          </div>
-        </section>
-
-        <section class="panel">
-          <h2>模型列表</h2>
-          <table class="table">
-            <thead><tr><th>模型 ID</th><th>上游 ID</th><th>名称</th></tr></thead>
-            <tbody id="modelRows"><tr><td colspan="3">正在读取...</td></tr></tbody>
-          </table>
-        </section>
-
-        <section class="panel">
-          <h2>运行状态</h2>
-          <div class="mono" id="statusBox">正在读取...</div>
-        </section>
-      </section>
-    </div>
-  </main>
-
-  <script>
-    const ADMIN_API = '/direct-admin/api';
-    const state = {
-      password: localStorage.getItem('cursor_direct_admin_password') || '',
-      remember: localStorage.getItem('cursor_direct_admin_remember') === '1',
-      status: null,
-      account: null,
-      models: [],
-    };
-    const $ = (id) => document.getElementById(id);
-
-    function escapeHtml(value) {
-      return String(value == null ? '' : value).replace(/[&<>"']/g, (char) => ({
-        '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;'
-      })[char]);
-    }
-    function fmtMs(value) {
-      const n = Math.max(0, Math.round(Number(value) || 0));
-      if (!n) return '-';
-      return n >= 1000 ? (n / 1000).toFixed(n >= 10000 ? 1 : 2) + 's' : n + 'ms';
-    }
-    function fmtBytes(bytes) {
-      const units = ['B', 'KB', 'MB', 'GB'];
-      let n = Number(bytes) || 0;
-      let i = 0;
-      while (n >= 1024 && i < units.length - 1) { n /= 1024; i += 1; }
-      return n.toFixed(n >= 10 || i === 0 ? 0 : 1) + ' ' + units[i];
-    }
-    function fmtTime(ms) {
-      if (!ms) return '-';
-      return new Date(ms).toLocaleString();
-    }
-    function setLoginVisible(visible) {
-      $('loginView').classList.toggle('hidden', !visible);
-      $('appView').classList.toggle('hidden', visible);
-    }
-    function setToast(id, text) {
-      $(id).textContent = text;
-    }
-    async function api(path, options = {}) {
-      const headers = Object.assign({}, options.headers || {}, { 'X-Admin-Password': state.password });
-      const response = await fetch(ADMIN_API + path, {
-        method: options.method || 'GET',
-        headers,
-        body: options.body,
-      });
-      const text = await response.text();
-      let data = null;
-      try { data = text ? JSON.parse(text) : null; } catch { data = text; }
-      if (response.status === 401) throw new Error('管理密码不正确');
-      if (!response.ok) {
-        const message = data && data.error && data.error.message ? data.error.message : response.statusText;
-        throw new Error(message || '请求失败');
-      }
-      return data;
-    }
-    function renderAccount(account) {
-      const loggedIn = Boolean(account && account.loggedIn);
-      const email = loggedIn ? (account.email || account.subject || '已登录') : '未登录';
-      $('accountValue').textContent = email;
-      $('accountHint').textContent = loggedIn ? 'Token 过期: ' + fmtTime(account.accessTokenExpiresAt) : '等待导入 auth.json';
-      $('authPill').className = loggedIn ? 'pill good' : 'pill bad';
-      $('authPill').textContent = loggedIn ? 'Cursor 账号已登录' : 'Cursor 账号未登录';
-      $('accountRows').innerHTML = '<tr>' +
-        '<td>' + (loggedIn ? '<span class="pill good">启用</span>' : '<span class="pill bad">缺失</span>') + '</td>' +
-        '<td>' + escapeHtml(email) + '<br><span style="color:var(--faint)">' + escapeHtml(account.subject || '') + '</span></td>' +
-        '<td>access: ' + escapeHtml(account.accessTokenPreview || '-') + '<br>refresh: ' + escapeHtml(account.refreshTokenPreview || '-') + '<br>过期: ' + escapeHtml(fmtTime(account.accessTokenExpiresAt)) + '</td>' +
-        '<td>' + escapeHtml(account.authPath || '-') + '</td>' +
-      '</tr>';
-    }
-    function renderModels(models) {
-      $('modelPill').textContent = String(models.length) + ' 个模型';
-      $('modelRows').innerHTML = models.length ? models.map((model) => '<tr><td>' + escapeHtml(model.id) + '</td><td>' + escapeHtml(model.modelId || model.id) + '</td><td>' + escapeHtml(model.displayName || '-') + '</td></tr>').join('') : '<tr><td colspan="3">没有模型返回。</td></tr>';
-      const preferred = ['composer-2-fast', 'composer-2.5-fast', 'auto'];
-      const ids = Array.from(new Set(preferred.concat(models.map((model) => model.id).filter(Boolean))));
-      $('probeModel').innerHTML = ids.map((id) => '<option value="' + escapeHtml(id) + '">' + escapeHtml(id) + '</option>').join('');
-    }
-    function renderStatus(status) {
-      const baseUrl = window.location.origin + status.apiBasePath;
-      $('runtimeLine').textContent = status.backend + ' · ' + status.config.agentHost + ' · ' + status.config.clientVersion;
-      $('baseUrlValue').textContent = baseUrl;
-      $('baseUrlInput').value = baseUrl;
-      $('requestsValue').textContent = String(status.stats.totalRequests || 0);
-      $('requestsHint').textContent = '成功 ' + (status.stats.successRequests || 0) + ' / 失败 ' + (status.stats.failedRequests || 0);
-      $('latencyValue').textContent = fmtMs(status.stats.lastDurationMs);
-      $('latencyHint').textContent = '平均 ' + fmtMs(status.stats.averageDurationMs);
-      $('healthPill').className = 'pill good';
-      $('healthPill').textContent = 'Direct Gateway 正常';
-      $('memoryPill').textContent = 'RSS ' + fmtBytes(status.memory.rss);
-      $('apiBox').textContent = [
-        'Base URL: ' + baseUrl,
-        'Models:   GET  ' + baseUrl + '/models',
-        'Chat:     POST ' + baseUrl + '/chat/completions',
-        'Health:   GET  ' + window.location.origin + '/health'
-      ].join('\\n');
-      $('statusBox').textContent = JSON.stringify(status, null, 2);
-    }
-    function renderAll(payloads) {
-      state.status = payloads.status;
-      state.account = payloads.account;
-      state.models = payloads.models;
-      renderStatus(state.status);
-      renderAccount(state.account);
-      renderModels(state.models);
-    }
-    async function refresh() {
-      const status = await api('/status');
-      const account = await api('/account');
-      let models = [];
-      try {
-        const modelPayload = await api('/models');
-        models = Array.isArray(modelPayload.models) ? modelPayload.models : [];
-      } catch (error) {
-        $('modelPill').className = 'pill warn';
-        $('modelPill').textContent = '模型读取失败';
-        $('modelRows').innerHTML = '<tr><td colspan="3">' + escapeHtml(error.message) + '</td></tr>';
-      }
-      renderAll({ status, account, models });
-    }
-    async function login() {
-      state.password = $('adminPassword').value.trim();
-      if (!state.password) {
-        setToast('loginStatus', '请先输入管理密码。');
-        return;
-      }
-      try {
-        await api('/status');
-        if (state.remember) {
-          localStorage.setItem('cursor_direct_admin_password', state.password);
-          localStorage.setItem('cursor_direct_admin_remember', '1');
-        }
-        setLoginVisible(false);
-        await refresh();
-      } catch (error) {
-        setToast('loginStatus', error.message);
-      }
-    }
-    async function saveAuth() {
-      setToast('authToast', '正在保存账号...');
-      try {
-        await api('/auth', {
-          method: 'POST',
-          headers: { 'content-type': 'application/json' },
-          body: JSON.stringify({ authJson: $('authJson').value }),
-        });
-        $('authJson').value = '';
-        setToast('authToast', '账号已保存。');
-        await refresh();
-      } catch (error) {
-        setToast('authToast', '保存失败: ' + error.message);
-      }
-    }
-    async function refreshToken() {
-      setToast('authToast', '正在强制刷新 token...');
-      try {
-        const result = await api('/refresh-token', { method: 'POST' });
-        setToast('authToast', result.refreshed ? 'Token 已刷新。' : 'Token 未刷新，可能还没到期或上游未返回新 token。');
-        await refresh();
-      } catch (error) {
-        setToast('authToast', '刷新失败: ' + error.message);
-      }
-    }
-    async function clearAuth() {
-      if (!confirm('确认清除当前 Cursor auth.json 吗？')) return;
-      await api('/logout', { method: 'POST' });
-      setToast('authToast', '账号已清除。');
-      await refresh();
-    }
-    async function runProbe() {
-      const model = $('probeModel').value || 'composer-2-fast';
-      $('probeBox').textContent = '正在请求 ' + model + '...';
-      try {
-        const result = await api('/probe', {
-          method: 'POST',
-          headers: { 'content-type': 'application/json' },
-          body: JSON.stringify({ model }),
-        });
-        $('probeBox').textContent = [
-          '模型: ' + result.model,
-          '耗时: ' + fmtMs(result.durationMs),
-          '输出: ' + (result.text || '-')
-        ].join('\\n');
-        await refresh();
-      } catch (error) {
-        $('probeBox').textContent = '探针失败: ' + error.message;
-      }
-    }
-    async function copyBaseUrl() {
-      const value = $('baseUrlInput').value || (window.location.origin + '/v1');
-      await navigator.clipboard.writeText(value).catch(() => {});
-    }
-    $('loginBtn').addEventListener('click', login);
-    $('adminPassword').addEventListener('keydown', (event) => { if (event.key === 'Enter') login(); });
-    $('rememberBtn').addEventListener('click', () => {
-      state.remember = !state.remember;
-      $('rememberBtn').textContent = state.remember ? '已记住本浏览器' : '记住本浏览器';
-      if (!state.remember) {
-        localStorage.removeItem('cursor_direct_admin_password');
-        localStorage.removeItem('cursor_direct_admin_remember');
-      }
-    });
-    $('logoutAdminBtn').addEventListener('click', () => {
-      localStorage.removeItem('cursor_direct_admin_password');
-      localStorage.removeItem('cursor_direct_admin_remember');
-      state.password = '';
-      $('adminPassword').value = '';
-      setLoginVisible(true);
-    });
-    $('refreshBtn').addEventListener('click', refresh);
-    $('copyBaseBtn').addEventListener('click', copyBaseUrl);
-    $('copyBaseInlineBtn').addEventListener('click', copyBaseUrl);
-    $('saveAuthBtn').addEventListener('click', saveAuth);
-    $('refreshTokenBtn').addEventListener('click', refreshToken);
-    $('clearAuthBtn').addEventListener('click', clearAuth);
-    $('probeBtn').addEventListener('click', runProbe);
-    if (state.remember && state.password) {
-      $('adminPassword').value = state.password;
-      login();
-    }
-  </script>
-</body>
-</html>`;
-}
 
 async function handle(req, res) {
   const url = new URL(req.url || "/", `http://${req.headers.host || "localhost"}`);
@@ -1254,7 +1426,7 @@ async function handle(req, res) {
     res.writeHead(204, {
       "access-control-allow-origin": "*",
       "access-control-allow-headers": "authorization,content-type,x-api-key,x-admin-password",
-      "access-control-allow-methods": "GET,POST,OPTIONS",
+      "access-control-allow-methods": "GET,POST,DELETE,OPTIONS",
     });
     res.end();
     return;
@@ -1264,6 +1436,16 @@ async function handle(req, res) {
     const response = json(200, getStatusPayload());
     res.writeHead(response.status, response.headers);
     res.end(req.method === "HEAD" ? undefined : response.body);
+    return;
+  }
+
+  if ((url.pathname === "/direct-admin-preview" || url.pathname === "/direct-admin-preview/") && (req.method === "GET" || req.method === "HEAD")) {
+    res.writeHead(301, {
+      location: "/direct-admin/",
+      "cache-control": "no-store",
+      "access-control-allow-origin": "*",
+    });
+    res.end();
     return;
   }
 
@@ -1302,6 +1484,148 @@ async function handle(req, res) {
       return;
     }
 
+    if (url.pathname === "/direct-admin/api/accounts" && req.method === "GET") {
+      try {
+        const response = json(200, summarizeAccountsStore(readAccountsStore(), {
+          legacyAccount: readLegacyDirectAccount() ? summarizeDirectAccount(readLegacyDirectAccount()) : null,
+        }));
+        res.writeHead(response.status, response.headers);
+        res.end(response.body);
+      } catch (error) {
+        const response = openAiError(500, "internal_error", error instanceof Error ? error.message : String(error));
+        res.writeHead(response.status, response.headers);
+        res.end(response.body);
+      }
+      return;
+    }
+
+    if (url.pathname === "/direct-admin/api/accounts/import" && req.method === "POST") {
+      try {
+        const body = await readRequestBody(req);
+        const result = importDirectAccounts(readAccountsStore(), body);
+        const store = writeAccountsStore(result.store);
+        modelCache.expiresAt = 0;
+        modelCache.models = [];
+        const response = json(200, {
+          ok: true,
+          imported: result.summaries,
+          accounts: summarizeAccountsStore(store),
+        });
+        res.writeHead(response.status, response.headers);
+        res.end(response.body);
+      } catch (error) {
+        const response = openAiError(400, "invalid_request_error", error instanceof Error ? error.message : String(error));
+        res.writeHead(response.status, response.headers);
+        res.end(response.body);
+      }
+      return;
+    }
+
+    const accountRoute = url.pathname.match(/^\/direct-admin\/api\/accounts\/([^/]+)(?:\/([^/]+))?$/);
+    if (accountRoute) {
+      const accountId = decodeURIComponent(accountRoute[1]);
+      const action = accountRoute[2] || "";
+      try {
+        if (req.method === "DELETE" && !action) {
+          const store = readAccountsStore();
+          const nextStore = writeAccountsStore({
+            ...store,
+            accounts: store.accounts.filter((account) => account.id !== accountId),
+            nextIndex: 0,
+          });
+          modelCache.expiresAt = 0;
+          modelCache.models = [];
+          const response = json(200, { ok: true, accounts: summarizeAccountsStore(nextStore) });
+          res.writeHead(response.status, response.headers);
+          res.end(response.body);
+          return;
+        }
+
+        if (req.method === "POST" && (action === "enable" || action === "disable")) {
+          const updated = updateStoredDirectAccount(accountId, (account) => ({
+            ...account,
+            enabled: action === "enable",
+            updatedAt: Date.now(),
+          }));
+          if (!updated) throw new Error(`Cursor direct account not found: ${accountId}`);
+          const response = json(200, {
+            ok: true,
+            account: summarizeDirectAccount(updated),
+            accounts: summarizeAccountsStore(readAccountsStore()),
+          });
+          res.writeHead(response.status, response.headers);
+          res.end(response.body);
+          return;
+        }
+
+        if (req.method === "POST" && action === "refresh-token") {
+          const store = readAccountsStore();
+          const account = store.accounts.find((item) => item.id === accountId);
+          if (!account) throw new Error(`Cursor direct account not found: ${accountId}`);
+          const refreshed = await refreshDirectAccount(account, { force: true });
+          const updated = updateStoredDirectAccount(accountId, () => refreshed);
+          const response = json(200, {
+            ok: true,
+            refreshed: Boolean(refreshed.refreshed),
+            account: summarizeDirectAccount(updated || refreshed),
+            accounts: summarizeAccountsStore(readAccountsStore()),
+          });
+          res.writeHead(response.status, response.headers);
+          res.end(response.body);
+          return;
+        }
+
+        const response = openAiError(404, "not_found_error", `Unsupported account action: ${action || req.method}`);
+        res.writeHead(response.status, response.headers);
+        res.end(response.body);
+      } catch (error) {
+        const response = openAiError(400, "invalid_request_error", error instanceof Error ? error.message : String(error));
+        res.writeHead(response.status, response.headers);
+        res.end(response.body);
+      }
+      return;
+    }
+
+    if (url.pathname === "/direct-admin/api/oauth/session" && req.method === "GET") {
+      const response = json(200, {
+        ok: true,
+        session: getOAuthSessionSnapshot(),
+        accounts: summarizeAccountsStore(readAccountsStore()),
+      });
+      res.writeHead(response.status, response.headers);
+      res.end(response.body);
+      return;
+    }
+
+    if (url.pathname === "/direct-admin/api/oauth/start" && req.method === "POST") {
+      try {
+        const result = await startDirectOAuthSession();
+        const response = json(200, result);
+        res.writeHead(response.status, response.headers);
+        res.end(response.body);
+      } catch (error) {
+        const response = openAiError(500, "internal_error", error instanceof Error ? error.message : String(error));
+        res.writeHead(response.status, response.headers);
+        res.end(response.body);
+      }
+      return;
+    }
+
+    if (url.pathname === "/direct-admin/api/oauth/callback" && req.method === "POST") {
+      try {
+        const body = await readRequestBody(req);
+        const result = await waitForDirectOAuthCompletion(body?.callbackUrl || body?.url || "");
+        const response = json(result.ok === false ? 202 : 200, result);
+        res.writeHead(response.status, response.headers);
+        res.end(response.body);
+      } catch (error) {
+        const response = openAiError(400, "invalid_request_error", error instanceof Error ? error.message : String(error));
+        res.writeHead(response.status, response.headers);
+        res.end(response.body);
+      }
+      return;
+    }
+
     if (url.pathname === "/direct-admin/api/models" && req.method === "GET") {
       try {
         const models = await listDirectModels({ fresh: url.searchParams.get("fresh") === "1" });
@@ -1319,20 +1643,17 @@ async function handle(req, res) {
     if (url.pathname === "/direct-admin/api/auth" && req.method === "POST") {
       try {
         const body = await readRequestBody(req);
-        const auth = typeof body?.authJson === "string" && body.authJson.trim()
-          ? JSON.parse(body.authJson)
-          : body;
-        const accessToken = auth?.accessToken || auth?.access_token;
-        const refreshToken = auth?.refreshToken || auth?.refresh_token;
-        if (!accessToken || !refreshToken) {
-          throw new Error("auth.json must include accessToken and refreshToken");
-        }
-        const next = { accessToken, refreshToken };
-        mkdirSync(path.dirname(config.authPath), { recursive: true });
-        writeFileSync(config.authPath, `${JSON.stringify(next, null, 2)}\n`, { mode: 0o600 });
+        const result = importDirectAccounts(readAccountsStore(), body);
+        if (result.imported.length === 0) throw new Error("No accounts found in request body");
+        const store = writeAccountsStore(result.store);
         modelCache.expiresAt = 0;
         modelCache.models = [];
-        const response = json(200, { ok: true, account: summarizeCursorAuth(next, { authPath: config.authPath }) });
+        const response = json(200, {
+          ok: true,
+          account: result.summaries[0],
+          accounts: summarizeAccountsStore(store),
+          imported: result.summaries,
+        });
         res.writeHead(response.status, response.headers);
         res.end(response.body);
       } catch (error) {
@@ -1345,11 +1666,16 @@ async function handle(req, res) {
 
     if (url.pathname === "/direct-admin/api/refresh-token" && req.method === "POST") {
       try {
-        const result = await refreshAuthRecord(readAuthFile(), { force: true });
+        const body = await readRequestBody(req).catch(() => ({}));
+        const result = await selectAndRefreshDirectAccount({
+          force: true,
+          accountId: body?.accountId || body?.id || url.searchParams.get("accountId") || "",
+        });
         const response = json(200, {
           ok: true,
-          refreshed: Boolean(result.refreshed),
-          account: summarizeCursorAuth(result, { authPath: config.authPath }),
+          refreshed: Boolean(result.account?.refreshed),
+          account: summarizeDirectAccount(result.account),
+          accounts: summarizeAccountsStore(readAccountsStore()),
         });
         res.writeHead(response.status, response.headers);
         res.end(response.body);
@@ -1377,7 +1703,7 @@ async function handle(req, res) {
       const started = Date.now();
       const finishRequest = beginTrackedRequest(model, prompt.length);
       try {
-        const result = await runDirectCompletion(prompt, model);
+        const result = await runDirectCompletionFromPool(prompt, model, { accountId: body?.accountId || "" });
         const durationMs = Date.now() - started;
         finishRequest(true, { outputChars: result.text.length });
         const response = json(200, {
@@ -1385,6 +1711,7 @@ async function handle(req, res) {
           model: displayModelId(model),
           durationMs,
           text: result.text,
+          account: result.account,
         });
         res.writeHead(response.status, response.headers);
         res.end(response.body);
@@ -1399,7 +1726,9 @@ async function handle(req, res) {
     }
 
     if (url.pathname === "/direct-admin/api/logout" && req.method === "POST") {
+      stopDirectOAuthSession("idle");
       clearAuthFile();
+      clearAccountsStore();
       modelCache.expiresAt = 0;
       modelCache.models = [];
       const response = json(200, { ok: true, account: await readAndSummarizeAuth() });
@@ -1461,7 +1790,7 @@ async function handle(req, res) {
     const finishRequest = beginTrackedRequest(model, prompt.length);
 
     try {
-      const result = await runDirectCompletion(prompt, model);
+      const result = await runDirectCompletionFromPool(prompt, model);
       finishRequest(true, { outputChars: result.text.length });
 
       if (body?.stream === true) {
@@ -1502,12 +1831,17 @@ export {
   buildDirectAdminHtml,
   buildDirectAdminStatusPayload,
   buildPromptFromMessages,
+  createLegacyDirectAccount,
   extractStringsFromProtobuf,
   generateChecksum,
+  importDirectAccounts,
+  isDirectAdminAuthorized,
   listDirectModels,
   normalizeDirectModel,
   pickAssistantCandidate,
+  selectDirectAccount,
   summarizeCursorAuth,
+  summarizeDirectAccount,
   runDirectCompletion,
 };
 

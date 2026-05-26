@@ -8,7 +8,13 @@ fi
 
 sudo install -o root -g root -m 0644 /tmp/cursor-nginx.conf /etc/nginx/conf.d/cursor-nginx.conf
 sudo rm -f /etc/nginx/sites-enabled/default
-sudo mkdir -p /opt/cursor-gateway /opt/cursor-direct-gateway
+sudo mkdir -p /opt/cursor-gateway /opt/cursor-direct-gateway /opt/cursor-admin-preview
+if [[ -f /tmp/admin-preview.html ]]; then
+  sudo install -o root -g root -m 0644 /tmp/admin-preview.html /opt/cursor-admin-preview/admin.html
+fi
+if [[ -f /tmp/direct-admin-preview.html ]]; then
+  sudo install -o root -g root -m 0644 /tmp/direct-admin-preview.html /opt/cursor-admin-preview/direct-admin.html
+fi
 
 sudo sed -i 's/^CURSOR_GATEWAY_HOST=.*/CURSOR_GATEWAY_HOST=127.0.0.1/' /opt/cursor-gateway/cursor-gateway.env
 if sudo grep -q '^CURSOR_GATEWAY_PORT=' /opt/cursor-gateway/cursor-gateway.env; then
