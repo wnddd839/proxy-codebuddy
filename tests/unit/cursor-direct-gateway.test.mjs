@@ -22,6 +22,7 @@ import {
   invalidateDirectMetadataCaches,
   isDirectAdminAuthorized,
   normalizeDirectModel,
+  normalizePublicModelName,
   pickAssistantCandidate,
   pickAssistantText,
   runDirectCompletionWithRetry,
@@ -104,6 +105,19 @@ test("normalizeDirectModel maps public auto alias to Cursor default model id", (
   assert.equal(normalizeDirectModel("auto"), "default");
   assert.equal(normalizeDirectModel("cursor/auto"), "default");
   assert.equal(normalizeDirectModel("cursor-acp/composer-2-fast"), "composer-2-fast");
+});
+
+test("normalizeDirectModel strips ANSI styling artifacts from ccswitch model names", () => {
+  assert.equal(normalizeDirectModel("auto[1m]"), "default");
+  assert.equal(normalizeDirectModel("\u001b[1mauto\u001b[22m"), "default");
+  assert.equal(normalizeDirectModel("cursor/auto[1m]"), "default");
+  assert.equal(normalizeDirectModel("sonnet[1m]"), "default");
+  assert.equal(normalizeDirectModel("claude-sonnet-4-5-20250929[1m]"), "sonnet-4.5");
+});
+
+test("normalizePublicModelName returns a clean model id for Claude-compatible responses", () => {
+  assert.equal(normalizePublicModelName("auto[1m]"), "auto");
+  assert.equal(normalizePublicModelName("\u001b[1mclaude-sonnet-4-5-20250929\u001b[22m"), "claude-sonnet-4-5-20250929");
 });
 
 test("normalizeDirectModel maps common Anthropic Claude aliases to Cursor direct model ids", () => {

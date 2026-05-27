@@ -218,14 +218,31 @@ function log(level, message, meta = undefined) {
 }
 
 function normalizeDirectModel(model) {
-  const raw = typeof model === "string" && model.trim() ? model.trim() : "auto";
+  const raw = sanitizeModelName(model);
   const cleaned = raw
     .replace(/^cursor-acp\//, "")
     .replace(/^cursor\//, "")
     .replace(/^cursor-/, "");
   const anthropicAlias = normalizeAnthropicModelAlias(cleaned);
   if (anthropicAlias) return anthropicAlias;
-  return cleaned === "auto" ? "default" : cleaned;
+  return ["auto", "default", "sonnet", "opus", "haiku"].includes(cleaned) ? "default" : cleaned;
+}
+
+function sanitizeModelName(model) {
+  const raw = typeof model === "string" && model.trim() ? model.trim() : "auto";
+  return raw
+    .replace(/\x1B\[[0-?]*[ -/]*[@-~]/g, "")
+    .replace(/\[(?:\d{1,3}(?:;\d{1,3})*)m\]?/g, "")
+    .replace(/[\u0000-\u001F\u007F]/g, "")
+    .trim() || "auto";
+}
+
+function normalizePublicModelName(model) {
+  const cleaned = sanitizeModelName(model)
+    .replace(/^cursor-acp\//, "")
+    .replace(/^cursor\//, "")
+    .replace(/^cursor-/, "");
+  return cleaned === "default" ? "auto" : cleaned;
 }
 
 function normalizeAnthropicModelAlias(model) {
@@ -3014,7 +3031,8 @@ async function handle(req, res) {
     }
 
     const messages = Array.isArray(body?.messages) ? body.messages : [];
-    const requestedModel = typeof body?.model === "string" && body.model.trim() ? body.model.trim() : "claude-sonnet-4-5";
+    const rawRequestedModel = typeof body?.model === "string" && body.model.trim() ? body.model.trim() : "claude-sonnet-4-5";
+    const requestedModel = normalizePublicModelName(rawRequestedModel);
     const model = normalizeDirectModel(requestedModel);
     const prompt = buildPromptFromClaudeMessages(messages, body?.system);
     const streamRequested = body?.stream === true;
@@ -3379,6 +3397,7 @@ export {
   isDirectAdminAuthorized,
   listDirectModels,
   normalizeDirectModel,
+  normalizePublicModelName,
   pickAssistantCandidate,
   pickAssistantText,
   runDirectCompletionWithRetry,
