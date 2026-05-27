@@ -11,6 +11,7 @@ import {
   createAssistantTextAccumulator,
   createClaudeMessage,
   createClaudeStreamEvent,
+  createClaudeTokenCount,
   createConnectFrameParser,
   createCursorClientResponsesForEvents,
   createDirectMetadataCaches,
@@ -22,6 +23,7 @@ import {
   invalidateDirectMetadataCaches,
   isDirectAdminAuthorized,
   normalizeDirectModel,
+  normalizeApiPath,
   normalizePublicModelName,
   pickAssistantCandidate,
   pickAssistantText,
@@ -107,6 +109,13 @@ test("normalizeDirectModel maps public auto alias to Cursor default model id", (
   assert.equal(normalizeDirectModel("cursor-acp/composer-2-fast"), "composer-2-fast");
 });
 
+test("normalizeApiPath collapses duplicated Claude Code v1 prefixes", () => {
+  assert.equal(normalizeApiPath("/v1/messages"), "/v1/messages");
+  assert.equal(normalizeApiPath("/v1/v1/messages"), "/v1/messages");
+  assert.equal(normalizeApiPath("/v1/v1/messages/count_tokens"), "/v1/messages/count_tokens");
+  assert.equal(normalizeApiPath("/direct-admin/api/status"), "/direct-admin/api/status");
+});
+
 test("normalizeDirectModel strips ANSI styling artifacts from ccswitch model names", () => {
   assert.equal(normalizeDirectModel("auto[1m]"), "default");
   assert.equal(normalizeDirectModel("\u001b[1mauto\u001b[22m"), "default");
@@ -165,6 +174,13 @@ test("createClaudeStreamEvent emits Anthropic SSE event frames", () => {
     }),
     'event: content_block_delta\ndata: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"hi"}}\n\n',
   );
+});
+
+test("createClaudeTokenCount returns Anthropic count_tokens response shape", () => {
+  const response = createClaudeTokenCount("USER: hello");
+
+  assert.equal(typeof response.input_tokens, "number");
+  assert.ok(response.input_tokens > 0);
 });
 
 test("extractStringsFromProtobuf recursively extracts nested printable strings", () => {

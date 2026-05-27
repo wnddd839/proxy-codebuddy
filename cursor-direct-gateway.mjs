@@ -245,6 +245,14 @@ function normalizePublicModelName(model) {
   return cleaned === "default" ? "auto" : cleaned;
 }
 
+function normalizeApiPath(pathname) {
+  let normalized = String(pathname || "/");
+  while (normalized.startsWith("/v1/v1/")) {
+    normalized = normalized.replace(/^\/v1\/v1(?=\/)/, "/v1");
+  }
+  return normalized === "/v1/v1" ? "/v1" : normalized;
+}
+
 function normalizeAnthropicModelAlias(model) {
   const text = String(model || "").trim().toLowerCase();
   if (!text.startsWith("claude-")) return "";
@@ -2465,6 +2473,12 @@ function createClaudeStreamEvent(event, payload) {
   return `event: ${event}\ndata: ${JSON.stringify(payload)}\n\n`;
 }
 
+function createClaudeTokenCount(prompt) {
+  return {
+    input_tokens: estimateClaudeUsage(prompt, "").input_tokens,
+  };
+}
+
 function sse(payload) {
   return `data: ${JSON.stringify(payload)}\n\n`;
 }
@@ -2658,6 +2672,7 @@ function buildDirectAdminClientConfig(options = {}) {
 
 async function handle(req, res) {
   const url = new URL(req.url || "/", `http://${req.headers.host || "localhost"}`);
+  const routePath = normalizeApiPath(url.pathname);
 
   if (req.method === "OPTIONS") {
     res.writeHead(204, {
@@ -2669,14 +2684,14 @@ async function handle(req, res) {
     return;
   }
 
-  if (url.pathname === "/health" && (req.method === "GET" || req.method === "HEAD")) {
+  if (routePath === "/health" && (req.method === "GET" || req.method === "HEAD")) {
     const response = json(200, getStatusPayload());
     res.writeHead(response.status, response.headers);
     res.end(req.method === "HEAD" ? undefined : response.body);
     return;
   }
 
-  if ((url.pathname === "/direct-admin-preview" || url.pathname === "/direct-admin-preview/") && (req.method === "GET" || req.method === "HEAD")) {
+  if ((routePath === "/direct-admin-preview" || routePath === "/direct-admin-preview/") && (req.method === "GET" || req.method === "HEAD")) {
     res.writeHead(301, {
       location: "/direct-admin/",
       "cache-control": "no-store",
@@ -2686,14 +2701,14 @@ async function handle(req, res) {
     return;
   }
 
-  if ((url.pathname === "/direct-admin" || url.pathname === "/direct-admin/") && (req.method === "GET" || req.method === "HEAD")) {
+  if ((routePath === "/direct-admin" || routePath === "/direct-admin/") && (req.method === "GET" || req.method === "HEAD")) {
     const response = html(200, buildDirectAdminHtml());
     res.writeHead(response.status, response.headers);
     res.end(req.method === "HEAD" ? undefined : response.body);
     return;
   }
 
-  if (url.pathname.startsWith("/direct-admin/api/")) {
+  if (routePath.startsWith("/direct-admin/api/")) {
     if (!isAdminAuthorized(req)) {
       const response = openAiError(401, "authentication_error", "Invalid or missing admin password");
       res.writeHead(response.status, response.headers);
@@ -2701,7 +2716,7 @@ async function handle(req, res) {
       return;
     }
 
-    if (url.pathname === "/direct-admin/api/status" && req.method === "GET") {
+    if (routePath === "/direct-admin/api/status" && req.method === "GET") {
       const response = json(200, buildDirectAdminStatusPayload({
         publicBaseUrl: getPublicBaseUrl(req),
       }));
@@ -2710,7 +2725,7 @@ async function handle(req, res) {
       return;
     }
 
-    if (url.pathname === "/direct-admin/api/client-config" && req.method === "GET") {
+    if (routePath === "/direct-admin/api/client-config" && req.method === "GET") {
       const response = json(200, buildDirectAdminClientConfig({
         publicBaseUrl: getPublicBaseUrl(req),
       }));
@@ -2719,7 +2734,7 @@ async function handle(req, res) {
       return;
     }
 
-    if (url.pathname === "/direct-admin/api/account" && req.method === "GET") {
+    if (routePath === "/direct-admin/api/account" && req.method === "GET") {
       try {
         const response = json(200, await readAndSummarizeAuth());
         res.writeHead(response.status, response.headers);
@@ -2732,7 +2747,7 @@ async function handle(req, res) {
       return;
     }
 
-    if (url.pathname === "/direct-admin/api/accounts" && req.method === "GET") {
+    if (routePath === "/direct-admin/api/accounts" && req.method === "GET") {
       try {
         const response = json(200, summarizeAccountsStore(readAccountsStore(), {
           legacyAccount: readLegacyDirectAccount() ? summarizeDirectAccount(readLegacyDirectAccount()) : null,
@@ -2747,7 +2762,7 @@ async function handle(req, res) {
       return;
     }
 
-    if (url.pathname === "/direct-admin/api/accounts/import" && req.method === "POST") {
+    if (routePath === "/direct-admin/api/accounts/import" && req.method === "POST") {
       try {
         const body = await readRequestBody(req);
         const result = importDirectAccounts(readAccountsStore(), body);
@@ -2768,7 +2783,7 @@ async function handle(req, res) {
       return;
     }
 
-    const accountRoute = url.pathname.match(/^\/direct-admin\/api\/accounts\/([^/]+)(?:\/([^/]+))?$/);
+    const accountRoute = routePath.match(/^\/direct-admin\/api\/accounts\/([^/]+)(?:\/([^/]+))?$/);
     if (accountRoute) {
       const accountId = decodeURIComponent(accountRoute[1]);
       const action = accountRoute[2] || "";
@@ -2834,14 +2849,14 @@ async function handle(req, res) {
       return;
     }
 
-    if (url.pathname === "/direct-admin/api/oauth/session" && req.method === "GET") {
+    if (routePath === "/direct-admin/api/oauth/session" && req.method === "GET") {
       const response = json(200, getOAuthSessionPayload());
       res.writeHead(response.status, response.headers);
       res.end(response.body);
       return;
     }
 
-    if (url.pathname === "/direct-admin/api/oauth/start" && req.method === "POST") {
+    if (routePath === "/direct-admin/api/oauth/start" && req.method === "POST") {
       try {
         const result = await startDirectOAuthSession();
         const response = json(200, result);
@@ -2855,7 +2870,7 @@ async function handle(req, res) {
       return;
     }
 
-    if (url.pathname === "/direct-admin/api/oauth/callback" && req.method === "POST") {
+    if (routePath === "/direct-admin/api/oauth/callback" && req.method === "POST") {
       try {
         const body = await readRequestBody(req);
         const result = await waitForDirectOAuthCompletion(body?.callbackUrl || body?.url || "");
@@ -2870,7 +2885,7 @@ async function handle(req, res) {
       return;
     }
 
-    if (url.pathname === "/direct-admin/api/models" && req.method === "GET") {
+    if (routePath === "/direct-admin/api/models" && req.method === "GET") {
       try {
         const models = await listDirectModels({ fresh: url.searchParams.get("fresh") === "1" });
         const response = json(200, { models });
@@ -2884,7 +2899,7 @@ async function handle(req, res) {
       return;
     }
 
-    if (url.pathname === "/direct-admin/api/auth" && req.method === "POST") {
+    if (routePath === "/direct-admin/api/auth" && req.method === "POST") {
       try {
         const body = await readRequestBody(req);
         const result = importDirectAccounts(readAccountsStore(), body);
@@ -2907,7 +2922,7 @@ async function handle(req, res) {
       return;
     }
 
-    if (url.pathname === "/direct-admin/api/refresh-token" && req.method === "POST") {
+    if (routePath === "/direct-admin/api/refresh-token" && req.method === "POST") {
       try {
         const body = await readRequestBody(req).catch(() => ({}));
         const result = await selectAndRefreshDirectAccount({
@@ -2931,7 +2946,7 @@ async function handle(req, res) {
       return;
     }
 
-    if (url.pathname === "/direct-admin/api/probe" && req.method === "POST") {
+    if (routePath === "/direct-admin/api/probe" && req.method === "POST") {
       let body = {};
       try {
         body = await readRequestBody(req);
@@ -2972,7 +2987,7 @@ async function handle(req, res) {
       return;
     }
 
-    if (url.pathname === "/direct-admin/api/logout" && req.method === "POST") {
+    if (routePath === "/direct-admin/api/logout" && req.method === "POST") {
       stopDirectOAuthSession("idle");
       clearAuthFile();
       clearAccountsStore();
@@ -2983,7 +2998,7 @@ async function handle(req, res) {
       return;
     }
 
-    const response = openAiError(404, "not_found_error", `Unsupported direct admin path: ${url.pathname}`);
+    const response = openAiError(404, "not_found_error", `Unsupported direct admin path: ${routePath}`);
     res.writeHead(response.status, response.headers);
     res.end(response.body);
     return;
@@ -2996,7 +3011,7 @@ async function handle(req, res) {
     return;
   }
 
-  if ((url.pathname === "/v1/models" || url.pathname === "/models") && req.method === "GET") {
+  if ((routePath === "/v1/models" || routePath === "/models") && req.method === "GET") {
     try {
       const created = Math.floor(Date.now() / 1000);
       const models = await listDirectModels();
@@ -3019,7 +3034,39 @@ async function handle(req, res) {
     return;
   }
 
-  if ((url.pathname === "/v1/messages" || url.pathname === "/messages") && req.method === "POST") {
+  if ((routePath === "/v1/messages/count_tokens" || routePath === "/messages/count_tokens") && req.method === "POST") {
+    let body;
+    try {
+      body = await readRequestBody(req);
+    } catch {
+      const response = openAiError(400, "invalid_request_error", "Invalid JSON body");
+      res.writeHead(response.status, response.headers);
+      res.end(response.body);
+      return;
+    }
+
+    const prompt = buildPromptFromClaudeMessages(
+      Array.isArray(body?.messages) ? body.messages : [],
+      body?.system,
+    );
+    const response = json(200, createClaudeTokenCount(prompt));
+    res.writeHead(response.status, response.headers);
+    res.end(response.body);
+    return;
+  }
+
+  if ((routePath === "/v1/messages" || routePath === "/messages") && req.method === "GET") {
+    const response = json(200, {
+      ok: true,
+      type: "messages_endpoint",
+      message: "Use POST /v1/messages for Claude-compatible requests",
+    });
+    res.writeHead(response.status, response.headers);
+    res.end(response.body);
+    return;
+  }
+
+  if ((routePath === "/v1/messages" || routePath === "/messages") && req.method === "POST") {
     let body;
     try {
       body = await readRequestBody(req);
@@ -3216,7 +3263,7 @@ async function handle(req, res) {
     return;
   }
 
-  if ((url.pathname === "/v1/chat/completions" || url.pathname === "/chat/completions") && req.method === "POST") {
+  if ((routePath === "/v1/chat/completions" || routePath === "/chat/completions") && req.method === "POST") {
     let body;
     try {
       body = await readRequestBody(req);
@@ -3369,7 +3416,7 @@ async function handle(req, res) {
     return;
   }
 
-  const response = openAiError(404, "not_found_error", `Unsupported path: ${url.pathname}`);
+  const response = openAiError(404, "not_found_error", `Unsupported path: ${routePath}`);
   res.writeHead(response.status, response.headers);
   res.end(response.body);
 }
@@ -3385,6 +3432,7 @@ export {
   createAssistantTextAccumulator,
   createClaudeMessage,
   createClaudeStreamEvent,
+  createClaudeTokenCount,
   createConnectFrameParser,
   createCursorClientResponsesForEvents,
   createDirectMetadataCaches,
@@ -3396,6 +3444,7 @@ export {
   invalidateDirectMetadataCaches,
   isDirectAdminAuthorized,
   listDirectModels,
+  normalizeApiPath,
   normalizeDirectModel,
   normalizePublicModelName,
   pickAssistantCandidate,
