@@ -72,6 +72,8 @@ const CURSOR_ASM_INTERACTION_UPDATE = 1;
 const CURSOR_ASM_EXEC_SERVER_MESSAGE = 2;
 const CURSOR_ASM_CONVERSATION_CHECKPOINT = 3;
 const CURSOR_ASM_KV_SERVER_MESSAGE = 4;
+const CURSOR_ACM_EXEC_CLIENT_MESSAGE = 2;
+const CURSOR_ACM_KV_CLIENT_MESSAGE = 3;
 const CURSOR_IU_TEXT_DELTA = 1;
 const CURSOR_IU_THINKING_DELTA = 4;
 const CURSOR_IU_THINKING_COMPLETED = 5;
@@ -81,6 +83,66 @@ const CURSOR_IU_TURN_ENDED = 14;
 const CURSOR_TEXT_DELTA_TEXT = 1;
 const CURSOR_THINKING_DELTA_TEXT = 1;
 const CURSOR_TOKEN_DELTA_VALUE = 1;
+const CURSOR_KSM_ID = 1;
+const CURSOR_KSM_GET_BLOB_ARGS = 2;
+const CURSOR_KSM_SET_BLOB_ARGS = 3;
+const CURSOR_KCM_ID = 1;
+const CURSOR_KCM_GET_BLOB_RESULT = 2;
+const CURSOR_KCM_SET_BLOB_RESULT = 3;
+const CURSOR_BLOB_ID = 1;
+const CURSOR_BLOB_DATA = 2;
+const CURSOR_ESM_ID = 1;
+const CURSOR_ESM_SHELL_ARGS = 2;
+const CURSOR_ESM_WRITE_ARGS = 3;
+const CURSOR_ESM_DELETE_ARGS = 4;
+const CURSOR_ESM_GREP_ARGS = 5;
+const CURSOR_ESM_READ_ARGS = 7;
+const CURSOR_ESM_LS_ARGS = 8;
+const CURSOR_ESM_DIAGNOSTICS_ARGS = 9;
+const CURSOR_ESM_REQUEST_CONTEXT_ARGS = 10;
+const CURSOR_ESM_MCP_ARGS = 11;
+const CURSOR_ESM_SHELL_STREAM_ARGS = 14;
+const CURSOR_ESM_EXEC_ID = 15;
+const CURSOR_ESM_BACKGROUND_SHELL_SPAWN = 16;
+const CURSOR_ESM_FETCH_ARGS = 20;
+const CURSOR_ESM_WRITE_SHELL_STDIN_ARGS = 23;
+const CURSOR_ECM_ID = 1;
+const CURSOR_ECM_SHELL_RESULT = 2;
+const CURSOR_ECM_WRITE_RESULT = 3;
+const CURSOR_ECM_DELETE_RESULT = 4;
+const CURSOR_ECM_GREP_RESULT = 5;
+const CURSOR_ECM_READ_RESULT = 7;
+const CURSOR_ECM_LS_RESULT = 8;
+const CURSOR_ECM_DIAGNOSTICS_RESULT = 9;
+const CURSOR_ECM_REQUEST_CONTEXT_RESULT = 10;
+const CURSOR_ECM_MCP_RESULT = 11;
+const CURSOR_ECM_SHELL_STREAM = 14;
+const CURSOR_ECM_EXEC_ID = 15;
+const CURSOR_ECM_BACKGROUND_SHELL_SPAWN_RESULT = 16;
+const CURSOR_ECM_FETCH_RESULT = 20;
+const CURSOR_ECM_WRITE_SHELL_STDIN_RESULT = 23;
+const CURSOR_REJECTED_READ = 3;
+const CURSOR_REJECTED_SHELL = 5;
+const CURSOR_REJECTED_WRITE = 5;
+const CURSOR_REJECTED_DELETE = 3;
+const CURSOR_REJECTED_LS = 3;
+const CURSOR_ERROR_GREP = 2;
+const CURSOR_ERROR_FETCH = 2;
+const CURSOR_REJECTED_BACKGROUND_SHELL = 2;
+const CURSOR_ERROR_WRITE_SHELL_STDIN = 2;
+const CURSOR_REQUEST_CONTEXT_SUCCESS = 1;
+const CURSOR_REQUEST_CONTEXT = 1;
+const CURSOR_MCP_ERROR = 2;
+const CURSOR_PATH = 1;
+const CURSOR_REASON = 2;
+const CURSOR_COMMAND = 1;
+const CURSOR_WORKING_DIRECTORY = 2;
+const CURSOR_SHELL_REASON = 3;
+const CURSOR_SHELL_IS_READONLY = 4;
+const CURSOR_ERROR_TEXT = 1;
+const CURSOR_FETCH_URL = 1;
+const CURSOR_FETCH_ERROR = 2;
+const CURSOR_EXEC_REJECT_REASON = "Tool not available in this environment. Use the MCP tools provided instead.";
 const stats = {
   totalRequests: 0,
   successRequests: 0,
@@ -1006,6 +1068,13 @@ class ProtoWriter {
     this.parts.push(buf);
   }
 
+  writeBytes(field, value) {
+    const buf = Buffer.from(value || Buffer.alloc(0));
+    this.writeVarint((field << 3) | 2);
+    this.writeVarint(buf.length);
+    this.parts.push(buf);
+  }
+
   writeMessage(field, writer) {
     const buf = writer.toBuffer();
     this.writeVarint((field << 3) | 2);
@@ -1016,6 +1085,10 @@ class ProtoWriter {
   writeInt32(field, value) {
     this.writeVarint((field << 3) | 0);
     this.writeVarint(value);
+  }
+
+  writeBool(field, value) {
+    this.writeInt32(field, value ? 1 : 0);
   }
 
   toBuffer() {
@@ -1169,6 +1242,31 @@ function decodeCursorStringField(buf, targetField, state) {
   return "";
 }
 
+function decodeCursorBytesField(buf, targetField, state) {
+  let pos = 0;
+  while (pos < buf.length) {
+    if (!countDecodedField(state)) break;
+    const [tag, tagEnd, tagOk] = readVarint(buf, pos);
+    if (!tagOk || tagEnd === pos) break;
+    pos = tagEnd;
+
+    const fieldNum = Math.floor(tag / 8);
+    const wireType = tag & 0x07;
+    if (wireType === PROTO_WIRE_LENGTH_DELIMITED) {
+      const [data, nextPos, ok] = readLengthDelimited(buf, pos);
+      if (!ok) break;
+      pos = nextPos;
+      if (fieldNum === targetField) return Buffer.from(data);
+      continue;
+    }
+
+    const [nextPos, ok] = skipProtoFieldValue(buf, pos, wireType);
+    if (!ok) break;
+    pos = nextPos;
+  }
+  return Buffer.alloc(0);
+}
+
 function decodeCursorVarintField(buf, targetField, state) {
   let pos = 0;
   while (pos < buf.length) {
@@ -1310,6 +1408,129 @@ function decodeCursorInteractionUpdate(buf, state = createParseState()) {
   return events;
 }
 
+function decodeCursorKvServerMessage(buf, state = createParseState()) {
+  const event = { type: "kv_server_message", kvId: 0 };
+  let pos = 0;
+
+  while (pos < buf.length) {
+    if (!countDecodedField(state)) break;
+    const [tag, tagEnd, tagOk] = readVarint(buf, pos);
+    if (!tagOk || tagEnd === pos) break;
+    pos = tagEnd;
+
+    const fieldNum = Math.floor(tag / 8);
+    const wireType = tag & 0x07;
+    if (wireType === PROTO_WIRE_VARINT && fieldNum === CURSOR_KSM_ID) {
+      const [value, nextPos, ok] = readVarint(buf, pos);
+      if (!ok) break;
+      event.kvId = value;
+      pos = nextPos;
+      continue;
+    }
+
+    if (wireType === PROTO_WIRE_LENGTH_DELIMITED) {
+      const [data, nextPos, ok] = readLengthDelimited(buf, pos);
+      if (!ok) break;
+      pos = nextPos;
+      if (fieldNum === CURSOR_KSM_GET_BLOB_ARGS) {
+        event.type = "kv_get_blob";
+        event.blobId = decodeCursorBytesField(data, CURSOR_BLOB_ID, state);
+      } else if (fieldNum === CURSOR_KSM_SET_BLOB_ARGS) {
+        event.type = "kv_set_blob";
+        event.blobId = decodeCursorBytesField(data, CURSOR_BLOB_ID, state);
+        event.blobData = decodeCursorBytesField(data, CURSOR_BLOB_DATA, state);
+      }
+      continue;
+    }
+
+    const [nextPos, ok] = skipProtoFieldValue(buf, pos, wireType);
+    if (!ok) break;
+    pos = nextPos;
+  }
+
+  return event;
+}
+
+function decodeCursorShellArgs(buf, state = createParseState()) {
+  return {
+    command: decodeCursorStringField(buf, CURSOR_COMMAND, state),
+    workingDirectory: decodeCursorStringField(buf, CURSOR_WORKING_DIRECTORY, state),
+  };
+}
+
+function decodeCursorExecServerMessage(buf, state = createParseState()) {
+  const event = { type: "exec_server_message", execMsgId: 0, execId: "" };
+  let pos = 0;
+
+  while (pos < buf.length) {
+    if (!countDecodedField(state)) break;
+    const [tag, tagEnd, tagOk] = readVarint(buf, pos);
+    if (!tagOk || tagEnd === pos) break;
+    pos = tagEnd;
+
+    const fieldNum = Math.floor(tag / 8);
+    const wireType = tag & 0x07;
+    if (wireType === PROTO_WIRE_VARINT && fieldNum === CURSOR_ESM_ID) {
+      const [value, nextPos, ok] = readVarint(buf, pos);
+      if (!ok) break;
+      event.execMsgId = value;
+      pos = nextPos;
+      continue;
+    }
+
+    if (wireType === PROTO_WIRE_LENGTH_DELIMITED) {
+      const [data, nextPos, ok] = readLengthDelimited(buf, pos);
+      if (!ok) break;
+      pos = nextPos;
+
+      if (fieldNum === CURSOR_ESM_EXEC_ID) {
+        event.execId = decodeUtf8Text(data);
+      } else if (fieldNum === CURSOR_ESM_REQUEST_CONTEXT_ARGS) {
+        event.type = "exec_request_context";
+      } else if (fieldNum === CURSOR_ESM_MCP_ARGS) {
+        event.type = "exec_mcp_error";
+      } else if (fieldNum === CURSOR_ESM_READ_ARGS) {
+        event.type = "exec_read_rejected";
+        event.path = decodeCursorStringField(data, CURSOR_PATH, state);
+      } else if (fieldNum === CURSOR_ESM_WRITE_ARGS) {
+        event.type = "exec_write_rejected";
+        event.path = decodeCursorStringField(data, CURSOR_PATH, state);
+      } else if (fieldNum === CURSOR_ESM_DELETE_ARGS) {
+        event.type = "exec_delete_rejected";
+        event.path = decodeCursorStringField(data, CURSOR_PATH, state);
+      } else if (fieldNum === CURSOR_ESM_LS_ARGS) {
+        event.type = "exec_ls_rejected";
+        event.path = decodeCursorStringField(data, CURSOR_PATH, state);
+      } else if (fieldNum === CURSOR_ESM_GREP_ARGS) {
+        event.type = "exec_grep_error";
+      } else if (fieldNum === CURSOR_ESM_SHELL_ARGS || fieldNum === CURSOR_ESM_SHELL_STREAM_ARGS) {
+        event.type = fieldNum === CURSOR_ESM_SHELL_STREAM_ARGS ? "exec_shell_stream_rejected" : "exec_shell_rejected";
+        Object.assign(event, decodeCursorShellArgs(data, state));
+      } else if (fieldNum === CURSOR_ESM_BACKGROUND_SHELL_SPAWN) {
+        event.type = "exec_background_shell_rejected";
+        Object.assign(event, decodeCursorShellArgs(data, state));
+      } else if (fieldNum === CURSOR_ESM_FETCH_ARGS) {
+        event.type = "exec_fetch_error";
+        event.url = decodeCursorStringField(data, CURSOR_FETCH_URL, state);
+      } else if (fieldNum === CURSOR_ESM_DIAGNOSTICS_ARGS) {
+        event.type = "exec_diagnostics_result";
+      } else if (fieldNum === CURSOR_ESM_WRITE_SHELL_STDIN_ARGS) {
+        event.type = "exec_write_shell_stdin_error";
+      } else if (event.type === "exec_server_message") {
+        event.type = "exec_other_error";
+        event.execFieldNumber = fieldNum;
+      }
+      continue;
+    }
+
+    const [nextPos, ok] = skipProtoFieldValue(buf, pos, wireType);
+    if (!ok) break;
+    pos = nextPos;
+  }
+
+  return event;
+}
+
 function decodeCursorServerMessage(payload, options = {}) {
   const state = options.state || createParseState(options);
   const events = [];
@@ -1339,9 +1560,9 @@ function decodeCursorServerMessage(payload, options = {}) {
     } else if (fieldNum === CURSOR_ASM_CONVERSATION_CHECKPOINT) {
       events.push({ type: "checkpoint", bytes: Buffer.from(data) });
     } else if (fieldNum === CURSOR_ASM_KV_SERVER_MESSAGE) {
-      events.push({ type: "kv_server_message", bytes: Buffer.from(data) });
+      events.push(decodeCursorKvServerMessage(data, state));
     } else if (fieldNum === CURSOR_ASM_EXEC_SERVER_MESSAGE) {
-      events.push({ type: "exec_server_message", bytes: Buffer.from(data) });
+      events.push(decodeCursorExecServerMessage(data, state));
     }
   }
 
@@ -1433,7 +1654,12 @@ function createConnectFrameParser(options = {}) {
               eventIndex,
             });
             state.strings += 1;
-          } else if (event.type === "turn_ended") {
+          } else if (
+            event.type === "turn_ended" ||
+            event.type === "kv_get_blob" ||
+            event.type === "kv_set_blob" ||
+            String(event.type || "").startsWith("exec_")
+          ) {
             events.push({ ...event, frameIndex, eventIndex });
           } else if (options.includeNonTextEvents) {
             events.push({ ...event, frameIndex, eventIndex });
@@ -1667,6 +1893,146 @@ function createAssistantTextAccumulator(options = {}) {
   };
 }
 
+function encodeAgentClientMessage(field, message) {
+  const clientMessage = new ProtoWriter();
+  clientMessage.writeMessage(field, message);
+  return clientMessage.toBuffer();
+}
+
+function encodeKvGetBlobResult(event, blobStore = new Map()) {
+  const result = new ProtoWriter();
+  const key = Buffer.from(event.blobId || Buffer.alloc(0)).toString("hex");
+  const blobData = typeof blobStore.get === "function" ? blobStore.get(key) : blobStore[key];
+  if (blobData) result.writeBytes(1, blobData);
+
+  const message = new ProtoWriter();
+  message.writeInt32(CURSOR_KCM_ID, event.kvId || 0);
+  message.writeMessage(CURSOR_KCM_GET_BLOB_RESULT, result);
+  return encodeAgentClientMessage(CURSOR_ACM_KV_CLIENT_MESSAGE, message);
+}
+
+function encodeKvSetBlobResult(event, blobStore = new Map()) {
+  const key = Buffer.from(event.blobId || Buffer.alloc(0)).toString("hex");
+  if (key && event.blobData) {
+    if (typeof blobStore.set === "function") blobStore.set(key, Buffer.from(event.blobData));
+    else blobStore[key] = Buffer.from(event.blobData);
+  }
+
+  const message = new ProtoWriter();
+  message.writeInt32(CURSOR_KCM_ID, event.kvId || 0);
+  message.writeMessage(CURSOR_KCM_SET_BLOB_RESULT, new ProtoWriter());
+  return encodeAgentClientMessage(CURSOR_ACM_KV_CLIENT_MESSAGE, message);
+}
+
+function encodeExecClientMessage(event, resultField, result) {
+  const message = new ProtoWriter();
+  message.writeInt32(CURSOR_ECM_ID, event.execMsgId || 0);
+  message.writeString(CURSOR_ECM_EXEC_ID, event.execId || "");
+  message.writeMessage(resultField, result);
+  return encodeAgentClientMessage(CURSOR_ACM_EXEC_CLIENT_MESSAGE, message);
+}
+
+function encodeExecRequestContextResult(event) {
+  const requestContext = new ProtoWriter();
+  const success = new ProtoWriter();
+  success.writeMessage(CURSOR_REQUEST_CONTEXT, requestContext);
+  const result = new ProtoWriter();
+  result.writeMessage(CURSOR_REQUEST_CONTEXT_SUCCESS, success);
+  return encodeExecClientMessage(event, CURSOR_ECM_REQUEST_CONTEXT_RESULT, result);
+}
+
+function encodePathRejected(event, resultField, rejectedField) {
+  const rejected = new ProtoWriter();
+  rejected.writeString(CURSOR_PATH, event.path || "");
+  rejected.writeString(CURSOR_REASON, CURSOR_EXEC_REJECT_REASON);
+  const result = new ProtoWriter();
+  result.writeMessage(rejectedField, rejected);
+  return encodeExecClientMessage(event, resultField, result);
+}
+
+function encodeShellRejected(event, resultField, rejectedField) {
+  const rejected = new ProtoWriter();
+  rejected.writeString(CURSOR_COMMAND, event.command || "");
+  rejected.writeString(CURSOR_WORKING_DIRECTORY, event.workingDirectory || "");
+  rejected.writeString(CURSOR_SHELL_REASON, CURSOR_EXEC_REJECT_REASON);
+  rejected.writeBool(CURSOR_SHELL_IS_READONLY, true);
+  const result = new ProtoWriter();
+  result.writeMessage(rejectedField, rejected);
+  return encodeExecClientMessage(event, resultField, result);
+}
+
+function encodeStringError(event, resultField, errorField, fields = {}) {
+  const error = new ProtoWriter();
+  for (const [field, value] of Object.entries(fields)) {
+    error.writeString(Number(field), value);
+  }
+  if (!Object.prototype.hasOwnProperty.call(fields, String(CURSOR_ERROR_TEXT))) {
+    error.writeString(CURSOR_ERROR_TEXT, CURSOR_EXEC_REJECT_REASON);
+  }
+  const result = new ProtoWriter();
+  result.writeMessage(errorField, error);
+  return encodeExecClientMessage(event, resultField, result);
+}
+
+function encodeExecMcpError(event) {
+  const error = new ProtoWriter();
+  error.writeString(CURSOR_ERROR_TEXT, CURSOR_EXEC_REJECT_REASON);
+  const result = new ProtoWriter();
+  result.writeMessage(CURSOR_MCP_ERROR, error);
+  return encodeExecClientMessage(event, CURSOR_ECM_MCP_RESULT, result);
+}
+
+function encodeCursorClientMessageForEvent(event, state = {}) {
+  if (event?.type === "kv_get_blob") return encodeKvGetBlobResult(event, state.blobStore);
+  if (event?.type === "kv_set_blob") return encodeKvSetBlobResult(event, state.blobStore);
+  if (event?.type === "exec_request_context") return encodeExecRequestContextResult(event);
+  if (event?.type === "exec_mcp_error") return encodeExecMcpError(event);
+  if (event?.type === "exec_read_rejected") return encodePathRejected(event, CURSOR_ECM_READ_RESULT, CURSOR_REJECTED_READ);
+  if (event?.type === "exec_write_rejected") return encodePathRejected(event, CURSOR_ECM_WRITE_RESULT, CURSOR_REJECTED_WRITE);
+  if (event?.type === "exec_delete_rejected") return encodePathRejected(event, CURSOR_ECM_DELETE_RESULT, CURSOR_REJECTED_DELETE);
+  if (event?.type === "exec_ls_rejected") return encodePathRejected(event, CURSOR_ECM_LS_RESULT, CURSOR_REJECTED_LS);
+  if (event?.type === "exec_grep_error") return encodeStringError(event, CURSOR_ECM_GREP_RESULT, CURSOR_ERROR_GREP);
+  if (event?.type === "exec_shell_rejected") return encodeShellRejected(event, CURSOR_ECM_SHELL_RESULT, CURSOR_REJECTED_SHELL);
+  if (event?.type === "exec_shell_stream_rejected") return encodeShellRejected(event, CURSOR_ECM_SHELL_STREAM, CURSOR_REJECTED_SHELL);
+  if (event?.type === "exec_background_shell_rejected") {
+    return encodeShellRejected(event, CURSOR_ECM_BACKGROUND_SHELL_SPAWN_RESULT, CURSOR_REJECTED_BACKGROUND_SHELL);
+  }
+  if (event?.type === "exec_fetch_error") {
+    return encodeStringError(event, CURSOR_ECM_FETCH_RESULT, CURSOR_ERROR_FETCH, {
+      [CURSOR_FETCH_URL]: event.url || "",
+      [CURSOR_FETCH_ERROR]: CURSOR_EXEC_REJECT_REASON,
+    });
+  }
+  if (event?.type === "exec_diagnostics_result") return encodeExecClientMessage(event, CURSOR_ECM_DIAGNOSTICS_RESULT, new ProtoWriter());
+  if (event?.type === "exec_write_shell_stdin_error") {
+    return encodeStringError(event, CURSOR_ECM_WRITE_SHELL_STDIN_RESULT, CURSOR_ERROR_WRITE_SHELL_STDIN);
+  }
+  return null;
+}
+
+function createCursorClientResponsesForEvents(events = [], state = {}) {
+  const frames = [];
+  for (const event of Array.isArray(events) ? events : []) {
+    const payload = encodeCursorClientMessageForEvent(event, state);
+    if (payload) frames.push(createConnectFrame(payload));
+  }
+  return frames;
+}
+
+function writeCursorClientResponses(events = [], request, state = {}) {
+  if (!request || request.destroyed || request.writableEnded) {
+    return { count: 0, bytes: 0 };
+  }
+  let count = 0;
+  let bytes = 0;
+  for (const frame of createCursorClientResponsesForEvents(events, state)) {
+    request.write(frame);
+    count += 1;
+    bytes += frame.length;
+  }
+  return { count, bytes };
+}
+
 function applyDirectCompletionEvents(events = [], options = {}) {
   const accumulator = options.accumulator || createAssistantTextAccumulator(options);
   const eventList = Array.isArray(events) ? events : [];
@@ -1749,6 +2115,7 @@ function runDirectCompletion(prompt, model, options = {}) {
     let request = null;
     let emittedContent = false;
     let abortHandler = null;
+    const cursorClientState = { blobStore: new Map() };
 
     const makeError = (message, errorOptions = {}) => {
       const error = new Error(message);
@@ -1854,12 +2221,15 @@ function runDirectCompletion(prompt, model, options = {}) {
     });
     request.on("data", (chunk) => {
       responseBytes += chunk.length;
+      let events = [];
       try {
-        handleCompletionEvents(parser.push(chunk));
+        events = parser.push(chunk);
       } catch (error) {
         settle(reject, makeError(error instanceof Error ? error.message : String(error)));
         return;
       }
+      writeCursorClientResponses(events, request, cursorClientState);
+      handleCompletionEvents(events);
       if (settled) return;
       clearTimeout(idleTimer);
       idleTimer = setTimeout(() => {
@@ -1877,7 +2247,7 @@ function runDirectCompletion(prompt, model, options = {}) {
       error.beforeFirstPayload = !emittedContent;
       settle(reject, error);
     });
-    request.end(payload);
+    request.write(payload);
   });
 }
 
@@ -2652,6 +3022,7 @@ export {
   createLegacyDirectAccount,
   createAssistantTextAccumulator,
   createConnectFrameParser,
+  createCursorClientResponsesForEvents,
   createDirectMetadataCaches,
   extractStringsFromProtobuf,
   generateChecksum,
@@ -2669,6 +3040,7 @@ export {
   summarizeCursorAuth,
   summarizeDirectAccount,
   runDirectCompletion,
+  writeCursorClientResponses,
 };
 
 const argvEntrypoint = process.argv[1] ? pathToFileURL(process.argv[1]).href : "";

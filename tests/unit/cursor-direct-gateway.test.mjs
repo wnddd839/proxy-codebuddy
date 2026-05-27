@@ -8,6 +8,7 @@ import {
   buildDirectAdminStatusPayload,
   createAssistantTextAccumulator,
   createConnectFrameParser,
+  createCursorClientResponsesForEvents,
   createDirectMetadataCaches,
   createLegacyDirectAccount,
   extractStringsFromProtobuf,
@@ -23,6 +24,7 @@ import {
   setMetadataCache,
   summarizeCursorAuth,
   summarizeDirectAccount,
+  writeCursorClientResponses,
 } from "../../cursor-direct-gateway.mjs";
 
 function encodeVarint(value) {
@@ -39,6 +41,15 @@ function encodeVarint(value) {
 function fieldString(field, value) {
   const body = Buffer.from(value, "utf8");
   return Buffer.concat([encodeVarint((field << 3) | 2), encodeVarint(body.length), body]);
+}
+
+function fieldBytes(field, value) {
+  const body = Buffer.from(value);
+  return Buffer.concat([encodeVarint((field << 3) | 2), encodeVarint(body.length), body]);
+}
+
+function fieldInt(field, value) {
+  return Buffer.concat([encodeVarint((field << 3) | 0), encodeVarint(value)]);
 }
 
 function fieldMessage(field, body) {
@@ -67,6 +78,21 @@ function cursorCheckpoint(text) {
 
 function cursorTurnEnded() {
   return fieldMessage(1, fieldMessage(14, Buffer.alloc(0)));
+}
+
+function cursorKvGetBlob(id, blobId) {
+  return fieldMessage(4, Buffer.concat([
+    fieldInt(1, id),
+    fieldMessage(2, fieldBytes(1, blobId)),
+  ]));
+}
+
+function cursorExecRequestContext(id, execId) {
+  return fieldMessage(2, Buffer.concat([
+    fieldInt(1, id),
+    fieldMessage(10, Buffer.alloc(0)),
+    fieldString(15, execId),
+  ]));
 }
 
 test("normalizeDirectModel maps public auto alias to Cursor default model id", () => {
@@ -271,6 +297,52 @@ test("applyDirectCompletionEvents appends Cursor text deltas without inserted sp
   assert.equal(accumulator.text, "DIRECT_ADMIN_OK");
   assert.equal(result.textEventCount, 4);
   assert.equal(result.connectEnded, true);
+});
+
+test("createConnectFrameParser emits actionable Cursor KV and exec events", () => {
+  const parser = createConnectFrameParser();
+  const events = parser.push(connectFrame(Buffer.concat([
+    cursorKvGetBlob(9, Buffer.from("blob-id")),
+    cursorExecRequestContext(7, "exec-1"),
+  ])));
+
+  assert.deepEqual(
+    events.map((event) => event.type),
+    ["kv_get_blob", "exec_request_context"],
+  );
+  assert.equal(events[0].kvId, 9);
+  assert.deepEqual(events[0].blobId, Buffer.from("blob-id"));
+  assert.equal(events[1].execMsgId, 7);
+  assert.equal(events[1].execId, "exec-1");
+});
+
+test("createCursorClientResponsesForEvents builds CPA-style response frames", () => {
+  const frames = createCursorClientResponsesForEvents([
+    { type: "kv_get_blob", kvId: 9, blobId: Buffer.from("missing") },
+    { type: "exec_request_context", execMsgId: 7, execId: "exec-1" },
+  ]);
+
+  assert.equal(frames.length, 2);
+  assert.equal(frames[0][0], 0);
+  assert.equal(frames[1][0], 0);
+  assert.ok(frames[0].length > 5);
+  assert.ok(frames[1].includes(Buffer.from("exec-1")));
+});
+
+test("writeCursorClientResponses writes CPA-style response frames to an open stream", () => {
+  const writes = [];
+  const result = writeCursorClientResponses([
+    { type: "exec_request_context", execMsgId: 7, execId: "exec-1" },
+  ], {
+    destroyed: false,
+    writableEnded: false,
+    write: (chunk) => writes.push(chunk),
+  });
+
+  assert.equal(result.count, 1);
+  assert.equal(writes.length, 1);
+  assert.equal(writes[0][0], 0);
+  assert.ok(writes[0].includes(Buffer.from("exec-1")));
 });
 
 test("metadata caches clone values and invalidate together", () => {
