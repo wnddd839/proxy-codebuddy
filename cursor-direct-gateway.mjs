@@ -11,6 +11,15 @@ import zlib from "node:zlib";
 import { buildDirectAdminHtml } from "./direct-admin-page.mjs";
 
 const DEFAULT_AUTH_PATH = path.join(homedir(), ".config", "cursor", "auth.json");
+const DEFAULT_DIRECT_PARSE_LIMITS = {
+  maxDepth: 8,
+  maxFields: 6000,
+  maxStrings: 3000,
+  maxStringBytes: 32000,
+  maxNestedBytes: 256000,
+  maxFrameBytes: 4 * 1024 * 1024,
+  maxTotalBytes: 8 * 1024 * 1024,
+};
 
 const config = {
   host: process.env.CURSOR_DIRECT_HOST || "127.0.0.1",
@@ -32,9 +41,19 @@ const config = {
   apiBaseUrl: process.env.CURSOR_DIRECT_API_BASE_URL || "https://api2.cursor.sh",
   agentHost: process.env.CURSOR_DIRECT_AGENT_HOST || "agentn.api5.cursor.sh",
   clientVersion: process.env.CURSOR_DIRECT_CLIENT_VERSION || "cli-2026.05.24-dda726e",
-  idleMs: Number(process.env.CURSOR_DIRECT_IDLE_MS || "1200"),
+  idleMs: Number(process.env.CURSOR_DIRECT_IDLE_MS || "6000"),
   hardTimeoutMs: Number(process.env.CURSOR_DIRECT_TIMEOUT_MS || "60000"),
+  streamKeepAliveMs: Number(process.env.CURSOR_DIRECT_STREAM_KEEPALIVE_MS || "15000"),
   modelsCacheTtlMs: Number(process.env.CURSOR_DIRECT_MODELS_CACHE_TTL_MS || "300000"),
+  authSummaryCacheTtlMs: Number(process.env.CURSOR_DIRECT_AUTH_CACHE_TTL_MS || "5000"),
+  oauthSessionCacheTtlMs: Number(process.env.CURSOR_DIRECT_OAUTH_CACHE_TTL_MS || "1000"),
+  parseMaxDepth: Number(process.env.CURSOR_DIRECT_PARSE_MAX_DEPTH || String(DEFAULT_DIRECT_PARSE_LIMITS.maxDepth)),
+  parseMaxFields: Number(process.env.CURSOR_DIRECT_PARSE_MAX_FIELDS || String(DEFAULT_DIRECT_PARSE_LIMITS.maxFields)),
+  parseMaxStrings: Number(process.env.CURSOR_DIRECT_PARSE_MAX_STRINGS || String(DEFAULT_DIRECT_PARSE_LIMITS.maxStrings)),
+  parseMaxStringBytes: Number(process.env.CURSOR_DIRECT_PARSE_MAX_STRING_BYTES || String(DEFAULT_DIRECT_PARSE_LIMITS.maxStringBytes)),
+  parseMaxNestedBytes: Number(process.env.CURSOR_DIRECT_PARSE_MAX_NESTED_BYTES || String(DEFAULT_DIRECT_PARSE_LIMITS.maxNestedBytes)),
+  parseMaxFrameBytes: Number(process.env.CURSOR_DIRECT_PARSE_MAX_FRAME_BYTES || String(DEFAULT_DIRECT_PARSE_LIMITS.maxFrameBytes)),
+  parseMaxTotalBytes: Number(process.env.CURSOR_DIRECT_PARSE_MAX_TOTAL_BYTES || String(DEFAULT_DIRECT_PARSE_LIMITS.maxTotalBytes)),
   logLevel: process.env.CURSOR_DIRECT_LOG_LEVEL || "info",
 };
 
@@ -42,7 +61,26 @@ const startedAt = Date.now();
 const OAUTH_URL_TIMEOUT_MS = 10000;
 const OAUTH_COMPLETE_TIMEOUT_MS = Number(process.env.CURSOR_DIRECT_OAUTH_TIMEOUT_MS || "180000");
 const OAUTH_POLL_INTERVAL_MS = 2000;
-const modelCache = { expiresAt: 0, models: [] };
+const UTF8_TEXT_DECODER = new TextDecoder("utf-8", { fatal: true });
+const CONNECT_COMPRESSION_FLAG = 0x01;
+const CONNECT_END_STREAM_FLAG = 0x02;
+const PROTO_WIRE_VARINT = 0;
+const PROTO_WIRE_FIXED64 = 1;
+const PROTO_WIRE_LENGTH_DELIMITED = 2;
+const PROTO_WIRE_FIXED32 = 5;
+const CURSOR_ASM_INTERACTION_UPDATE = 1;
+const CURSOR_ASM_EXEC_SERVER_MESSAGE = 2;
+const CURSOR_ASM_CONVERSATION_CHECKPOINT = 3;
+const CURSOR_ASM_KV_SERVER_MESSAGE = 4;
+const CURSOR_IU_TEXT_DELTA = 1;
+const CURSOR_IU_THINKING_DELTA = 4;
+const CURSOR_IU_THINKING_COMPLETED = 5;
+const CURSOR_IU_TOKEN_DELTA = 8;
+const CURSOR_IU_HEARTBEAT = 13;
+const CURSOR_IU_TURN_ENDED = 14;
+const CURSOR_TEXT_DELTA_TEXT = 1;
+const CURSOR_THINKING_DELTA_TEXT = 1;
+const CURSOR_TOKEN_DELTA_VALUE = 1;
 const stats = {
   totalRequests: 0,
   successRequests: 0,
@@ -55,7 +93,58 @@ const stats = {
   lastPromptChars: 0,
   lastOutputChars: 0,
   lastRequestAt: 0,
+  lastStream: false,
+  lastUpstreamBytes: 0,
+  lastStringCount: 0,
+  lastDeltaCount: 0,
 };
+
+function cloneMetadataValue(value) {
+  if (value == null) return value;
+  return JSON.parse(JSON.stringify(value));
+}
+
+function createMetadataCacheEntry() {
+  return { expiresAt: 0, value: null };
+}
+
+function createDirectMetadataCaches() {
+  return {
+    models: createMetadataCacheEntry(),
+    authSummary: createMetadataCacheEntry(),
+    oauthSession: createMetadataCacheEntry(),
+  };
+}
+
+const metadataCaches = createDirectMetadataCaches();
+
+function setMetadataCache(cache, value, options = {}) {
+  if (!cache) return value;
+  const now = Number(options.now || Date.now());
+  const ttlMs = Math.max(0, Number(options.ttlMs || 0));
+  cache.value = cloneMetadataValue(value);
+  cache.expiresAt = now + ttlMs;
+  return cloneMetadataValue(value);
+}
+
+function getMetadataCache(cache, options = {}) {
+  if (!cache || cache.value == null) return null;
+  const now = Number(options.now || Date.now());
+  if (cache.expiresAt <= 0 || now >= cache.expiresAt) return null;
+  return cloneMetadataValue(cache.value);
+}
+
+function clearMetadataCache(cache) {
+  if (!cache) return;
+  cache.expiresAt = 0;
+  cache.value = null;
+}
+
+function invalidateDirectMetadataCaches(caches = metadataCaches) {
+  clearMetadataCache(caches.models);
+  clearMetadataCache(caches.authSummary);
+  clearMetadataCache(caches.oauthSession);
+}
 
 function log(level, message, meta = undefined) {
   const order = { debug: 10, info: 20, warn: 30, error: 40 };
@@ -476,8 +565,7 @@ async function selectAndRefreshDirectAccount(options = {}) {
       const accounts = nextStore.accounts.slice();
       accounts[selected.index] = normalizeStoredDirectAccount(refreshed);
       nextStore = writeAccountsStore({ ...nextStore, accounts });
-      modelCache.expiresAt = 0;
-      modelCache.models = [];
+      invalidateDirectMetadataCaches();
     }
     return { ...selected, account: refreshed, store: nextStore };
   }
@@ -543,6 +631,17 @@ function getOAuthSessionSnapshot() {
   };
 }
 
+function getOAuthSessionPayload() {
+  const cached = getMetadataCache(metadataCaches.oauthSession, { now: Date.now() });
+  if (cached) return cached;
+  const payload = {
+    ok: true,
+    session: getOAuthSessionSnapshot(),
+    accounts: summarizeAccountsStore(readAccountsStore()),
+  };
+  return setMetadataCache(metadataCaches.oauthSession, payload, { ttlMs: config.oauthSessionCacheTtlMs });
+}
+
 function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
@@ -557,6 +656,7 @@ function stopDirectOAuthSession(reason = "idle") {
   }
   oauthSession = createOAuthSessionState();
   oauthSession.status = reason;
+  clearMetadataCache(metadataCaches.oauthSession);
 }
 
 function importCurrentAuthFileToPool(options = {}) {
@@ -569,8 +669,7 @@ function importCurrentAuthFileToPool(options = {}) {
     authPath: config.authPath,
   });
   const nextStore = writeAccountsStore(result.store);
-  modelCache.expiresAt = 0;
-  modelCache.models = [];
+  invalidateDirectMetadataCaches();
   return {
     ok: true,
     accounts: summarizeAccountsStore(nextStore),
@@ -588,6 +687,7 @@ async function startDirectOAuthSession() {
   }
 
   oauthSession = createOAuthSessionState();
+  clearMetadataCache(metadataCaches.oauthSession);
   oauthSession.id = `${Date.now()}-${Math.random().toString(16).slice(2)}`;
   oauthSession.status = "starting";
   oauthSession.startedAt = Date.now();
@@ -618,6 +718,7 @@ async function startDirectOAuthSession() {
       oauthSession.url = url;
       oauthSession.status = "waiting";
       oauthSession.updatedAt = Date.now();
+      clearMetadataCache(metadataCaches.oauthSession);
       settle(resolve, {
         reused: false,
         session: getOAuthSessionSnapshot(),
@@ -663,6 +764,7 @@ async function startDirectOAuthSession() {
         oauthSession.status = "complete";
         oauthSession.completedAt = Date.now();
         oauthSession.error = "";
+        clearMetadataCache(metadataCaches.oauthSession);
         settle(resolve, {
           ...imported,
           session: getOAuthSessionSnapshot(),
@@ -673,6 +775,7 @@ async function startDirectOAuthSession() {
           oauthSession.error = stripAnsi(oauthSession.stderr).trim()
             || stripAnsi(oauthSession.stdout).trim()
             || `cursor-agent login exited with code ${String(code ?? "unknown")}`;
+          clearMetadataCache(metadataCaches.oauthSession);
           settle(reject, new Error(oauthSession.error));
         }
       }
@@ -683,6 +786,7 @@ async function startDirectOAuthSession() {
       oauthSession.status = "failed";
       oauthSession.error = "生成 Cursor 授权链接超时";
       oauthSession.updatedAt = Date.now();
+      clearMetadataCache(metadataCaches.oauthSession);
       if (child.exitCode === null) {
         try {
           child.kill("SIGTERM");
@@ -699,6 +803,7 @@ async function waitForDirectOAuthCompletion(callbackUrl = "") {
   if (callbackUrl) {
     oauthSession.callbackUrl = String(callbackUrl).trim();
     oauthSession.updatedAt = Date.now();
+    clearMetadataCache(metadataCaches.oauthSession);
     if (oauthSession.child?.stdin?.writable) {
       try {
         oauthSession.child.stdin.write(`${oauthSession.callbackUrl}\n`);
@@ -716,6 +821,7 @@ async function waitForDirectOAuthCompletion(callbackUrl = "") {
       oauthSession.completedAt = Date.now();
       oauthSession.error = "";
       oauthSession.updatedAt = Date.now();
+      clearMetadataCache(metadataCaches.oauthSession);
       return {
         ...imported,
         session: getOAuthSessionSnapshot(),
@@ -724,6 +830,7 @@ async function waitForDirectOAuthCompletion(callbackUrl = "") {
       if (oauthSession.exitCode !== null && oauthSession.exitCode !== 0) {
         oauthSession.status = "failed";
         oauthSession.error ||= "Cursor 登录进程已退出，认证未完成";
+        clearMetadataCache(metadataCaches.oauthSession);
         break;
       }
       await sleep(OAUTH_POLL_INTERVAL_MS);
@@ -734,6 +841,7 @@ async function waitForDirectOAuthCompletion(callbackUrl = "") {
     oauthSession.status = "waiting";
     oauthSession.error = "尚未检测到 Cursor 登录态，请完成浏览器授权后重试";
     oauthSession.updatedAt = Date.now();
+    clearMetadataCache(metadataCaches.oauthSession);
   }
 
   return {
@@ -781,9 +889,12 @@ async function refreshAuthRecord(auth, options = {}) {
 }
 
 async function readAndSummarizeAuth() {
+  const cached = getMetadataCache(metadataCaches.authSummary, { now: Date.now() });
+  if (cached) return cached;
   const store = readAccountsStore();
   const legacy = readLegacyDirectAccount();
-  return summarizeAccountsStore(store, { legacyAccount: legacy ? summarizeDirectAccount(legacy) : null });
+  const summary = summarizeAccountsStore(store, { legacyAccount: legacy ? summarizeDirectAccount(legacy) : null });
+  return setMetadataCache(metadataCaches.authSummary, summary, { ttlMs: config.authSummaryCacheTtlMs });
 }
 
 function clearAuthFile() {
@@ -841,8 +952,9 @@ function cursorHeaders(token, extra = {}) {
 
 async function listDirectModels(options = {}) {
   const now = Date.now();
-  if (!options.fresh && modelCache.models.length > 0 && now < modelCache.expiresAt) {
-    return modelCache.models;
+  const cached = getMetadataCache(metadataCaches.models, { now });
+  if (!options.fresh && Array.isArray(cached) && cached.length > 0) {
+    return cached;
   }
 
   const token = options.accessToken || options.account?.accessToken || await getAccessToken();
@@ -870,9 +982,7 @@ async function listDirectModels(options = {}) {
     }))
     .filter((row) => row.id && row.modelId);
 
-  modelCache.expiresAt = now + Math.max(0, config.modelsCacheTtlMs);
-  modelCache.models = models;
-  return models;
+  return setMetadataCache(metadataCaches.models, models, { now, ttlMs: config.modelsCacheTtlMs });
 }
 
 class ProtoWriter {
@@ -963,28 +1073,158 @@ function createConnectFrame(payload) {
   return frame;
 }
 
+function getDirectParseLimits(options = {}) {
+  const custom = options.limits || {};
+  return {
+    maxDepth: Number(custom.maxDepth || config.parseMaxDepth || DEFAULT_DIRECT_PARSE_LIMITS.maxDepth),
+    maxFields: Number(custom.maxFields || config.parseMaxFields || DEFAULT_DIRECT_PARSE_LIMITS.maxFields),
+    maxStrings: Number(custom.maxStrings || config.parseMaxStrings || DEFAULT_DIRECT_PARSE_LIMITS.maxStrings),
+    maxStringBytes: Number(custom.maxStringBytes || config.parseMaxStringBytes || DEFAULT_DIRECT_PARSE_LIMITS.maxStringBytes),
+    maxNestedBytes: Number(custom.maxNestedBytes || config.parseMaxNestedBytes || DEFAULT_DIRECT_PARSE_LIMITS.maxNestedBytes),
+    maxFrameBytes: Number(custom.maxFrameBytes || config.parseMaxFrameBytes || DEFAULT_DIRECT_PARSE_LIMITS.maxFrameBytes),
+    maxTotalBytes: Number(custom.maxTotalBytes || config.parseMaxTotalBytes || DEFAULT_DIRECT_PARSE_LIMITS.maxTotalBytes),
+  };
+}
+
 function readVarint(buf, pos) {
   let result = 0;
   let shift = 0;
   let cursor = pos;
-  while (cursor < buf.length) {
+  while (cursor < buf.length && shift <= 63) {
     const byte = buf[cursor];
     cursor += 1;
-    result |= (byte & 0x7f) << shift;
-    if ((byte & 0x80) === 0) break;
+    result += (byte & 0x7f) * (2 ** shift);
+    if ((byte & 0x80) === 0) return [result, cursor, true];
     shift += 7;
   }
-  return [result, cursor];
+  return [0, pos, false];
 }
 
-function extractStringsFromProtobuf(buf, fieldPath = "", depth = 0) {
-  if (!buf || depth > 8) return [];
+function readLengthDelimited(buf, pos) {
+  const [len, dataStart, lenOk] = readVarint(buf, pos);
+  if (!lenOk || dataStart === pos || len < 0 || !Number.isSafeInteger(len)) {
+    return [null, pos, false];
+  }
+  const dataEnd = dataStart + len;
+  if (dataEnd > buf.length) return [null, pos, false];
+  return [buf.subarray(dataStart, dataEnd), dataEnd, true];
+}
+
+function skipProtoFieldValue(buf, pos, wireType) {
+  if (wireType === PROTO_WIRE_VARINT) {
+    const [, nextPos, ok] = readVarint(buf, pos);
+    return [nextPos, ok && nextPos > pos];
+  }
+  if (wireType === PROTO_WIRE_FIXED64) {
+    const nextPos = pos + 8;
+    return [nextPos, nextPos <= buf.length];
+  }
+  if (wireType === PROTO_WIRE_LENGTH_DELIMITED) {
+    const [, nextPos, ok] = readLengthDelimited(buf, pos);
+    return [nextPos, ok && nextPos >= pos];
+  }
+  if (wireType === PROTO_WIRE_FIXED32) {
+    const nextPos = pos + 4;
+    return [nextPos, nextPos <= buf.length];
+  }
+  return [pos, false];
+}
+
+function countDecodedField(state) {
+  if (!state?.limits) return true;
+  state.fields += 1;
+  return state.fields <= state.limits.maxFields;
+}
+
+function decodeUtf8Text(data) {
+  try {
+    return UTF8_TEXT_DECODER.decode(data);
+  } catch {
+    return "";
+  }
+}
+
+function decodeCursorStringField(buf, targetField, state) {
+  let pos = 0;
+  while (pos < buf.length) {
+    if (!countDecodedField(state)) break;
+    const [tag, tagEnd, tagOk] = readVarint(buf, pos);
+    if (!tagOk || tagEnd === pos) break;
+    pos = tagEnd;
+
+    const fieldNum = Math.floor(tag / 8);
+    const wireType = tag & 0x07;
+    if (wireType === PROTO_WIRE_LENGTH_DELIMITED) {
+      const [data, nextPos, ok] = readLengthDelimited(buf, pos);
+      if (!ok) break;
+      pos = nextPos;
+      if (fieldNum === targetField) return decodeUtf8Text(data);
+      continue;
+    }
+
+    const [nextPos, ok] = skipProtoFieldValue(buf, pos, wireType);
+    if (!ok) break;
+    pos = nextPos;
+  }
+  return "";
+}
+
+function decodeCursorVarintField(buf, targetField, state) {
+  let pos = 0;
+  while (pos < buf.length) {
+    if (!countDecodedField(state)) break;
+    const [tag, tagEnd, tagOk] = readVarint(buf, pos);
+    if (!tagOk || tagEnd === pos) break;
+    pos = tagEnd;
+
+    const fieldNum = Math.floor(tag / 8);
+    const wireType = tag & 0x07;
+    if (wireType === PROTO_WIRE_VARINT) {
+      const [value, nextPos, ok] = readVarint(buf, pos);
+      if (!ok) break;
+      pos = nextPos;
+      if (fieldNum === targetField) return value;
+      continue;
+    }
+
+    const [nextPos, ok] = skipProtoFieldValue(buf, pos, wireType);
+    if (!ok) break;
+    pos = nextPos;
+  }
+  return 0;
+}
+
+function createParseState(options = {}) {
+  return {
+    fields: 0,
+    strings: 0,
+    limits: getDirectParseLimits(options),
+  };
+}
+
+function isPrintableTextBuffer(data, limits = getDirectParseLimits()) {
+  if (!data || data.length <= 0 || data.length > limits.maxStringBytes) return false;
+  let text = "";
+  try {
+    text = UTF8_TEXT_DECODER.decode(data);
+  } catch {
+    return false;
+  }
+  if (!text || text.includes("\uFFFD")) return false;
+  return !/[\u0000-\u0008\u000B\u000C\u000E-\u001F\u007F]/u.test(text);
+}
+
+function extractStringsFromProtobuf(buf, fieldPath = "", depth = 0, state = createParseState()) {
+  if (!buf || depth > state.limits.maxDepth || state.fields >= state.limits.maxFields) return [];
   const strings = [];
   let pos = 0;
 
   while (pos < buf.length) {
-    const [tag, tagEnd] = readVarint(buf, pos);
-    if (tagEnd === pos) break;
+    if (state.fields >= state.limits.maxFields || state.strings >= state.limits.maxStrings) break;
+    state.fields += 1;
+
+    const [tag, tagEnd, tagOk] = readVarint(buf, pos);
+    if (!tagOk || tagEnd === pos) break;
     pos = tagEnd;
 
     const fieldNum = tag >> 3;
@@ -992,21 +1232,29 @@ function extractStringsFromProtobuf(buf, fieldPath = "", depth = 0) {
     const currentPath = fieldPath ? `${fieldPath}.${fieldNum}` : String(fieldNum);
 
     if (wireType === 0) {
-      const [, nextPos] = readVarint(buf, pos);
+      const [, nextPos, ok] = readVarint(buf, pos);
+      if (!ok || nextPos === pos) break;
       pos = nextPos;
     } else if (wireType === 1) {
+      if (pos + 8 > buf.length) break;
       pos += 8;
     } else if (wireType === 2) {
-      const [len, dataStart] = readVarint(buf, pos);
+      const [len, dataStart, lenOk] = readVarint(buf, pos);
+      if (!lenOk || dataStart === pos) break;
       pos = dataStart + len;
-      if (len <= 0 || dataStart + len > buf.length) continue;
+      if (len <= 0 || dataStart + len > buf.length) break;
       const data = buf.subarray(dataStart, dataStart + len);
-      strings.push(...extractStringsFromProtobuf(data, currentPath, depth + 1));
-      const text = data.toString("utf8");
-      if (text && /^[\x09\x0a\x0d\x20-\x7e]+$/.test(text)) {
+      if (isPrintableTextBuffer(data, state.limits)) {
+        const text = data.toString("utf8");
         strings.push({ text, fieldPath: currentPath, depth, frameIndex: 0 });
+        state.strings += 1;
+        continue;
+      }
+      if (len <= state.limits.maxNestedBytes) {
+        strings.push(...extractStringsFromProtobuf(data, currentPath, depth + 1, state));
       }
     } else if (wireType === 5) {
+      if (pos + 4 > buf.length) break;
       pos += 4;
     } else {
       break;
@@ -1016,32 +1264,190 @@ function extractStringsFromProtobuf(buf, fieldPath = "", depth = 0) {
   return strings;
 }
 
-function parseConnectFrames(data) {
-  const strings = [];
-  let offset = 0;
-  let frameIndex = 0;
+function decodeCursorInteractionUpdate(buf, state = createParseState()) {
+  const events = [];
+  let pos = 0;
 
-  while (offset + 5 <= data.length) {
-    const flags = data[offset];
-    const length = data.readUInt32BE(offset + 1);
-    if (offset + 5 + length > data.length) break;
-    let payload = data.subarray(offset + 5, offset + 5 + length);
-    if (flags === 1) {
-      try {
-        payload = zlib.gunzipSync(payload);
-      } catch {
-        // keep the original payload
-      }
+  while (pos < buf.length) {
+    if (!countDecodedField(state)) break;
+    const [tag, tagEnd, tagOk] = readVarint(buf, pos);
+    if (!tagOk || tagEnd === pos) break;
+    pos = tagEnd;
+
+    const fieldNum = Math.floor(tag / 8);
+    const wireType = tag & 0x07;
+    if (wireType !== PROTO_WIRE_LENGTH_DELIMITED) {
+      const [nextPos, ok] = skipProtoFieldValue(buf, pos, wireType);
+      if (!ok) break;
+      pos = nextPos;
+      continue;
     }
 
-    for (const item of extractStringsFromProtobuf(payload)) {
-      strings.push({ ...item, frameIndex });
+    const [data, nextPos, ok] = readLengthDelimited(buf, pos);
+    if (!ok) break;
+    pos = nextPos;
+
+    if (fieldNum === CURSOR_IU_TEXT_DELTA) {
+      const text = decodeCursorStringField(data, CURSOR_TEXT_DELTA_TEXT, state);
+      if (text) events.push({ type: "text_delta", text });
+    } else if (fieldNum === CURSOR_IU_THINKING_DELTA) {
+      const text = decodeCursorStringField(data, CURSOR_THINKING_DELTA_TEXT, state);
+      events.push({ type: "thinking_delta", text });
+    } else if (fieldNum === CURSOR_IU_THINKING_COMPLETED) {
+      events.push({ type: "thinking_completed" });
+    } else if (fieldNum === CURSOR_IU_TOKEN_DELTA) {
+      events.push({
+        type: "token_delta",
+        tokenDelta: decodeCursorVarintField(data, CURSOR_TOKEN_DELTA_VALUE, state),
+      });
+    } else if (fieldNum === CURSOR_IU_HEARTBEAT) {
+      events.push({ type: "heartbeat" });
+    } else if (fieldNum === CURSOR_IU_TURN_ENDED) {
+      events.push({ type: "turn_ended" });
     }
-    offset += 5 + length;
-    frameIndex += 1;
   }
 
-  return strings;
+  return events;
+}
+
+function decodeCursorServerMessage(payload, options = {}) {
+  const state = options.state || createParseState(options);
+  const events = [];
+  let pos = 0;
+
+  while (pos < payload.length) {
+    if (!countDecodedField(state)) break;
+    const [tag, tagEnd, tagOk] = readVarint(payload, pos);
+    if (!tagOk || tagEnd === pos) break;
+    pos = tagEnd;
+
+    const fieldNum = Math.floor(tag / 8);
+    const wireType = tag & 0x07;
+    if (wireType !== PROTO_WIRE_LENGTH_DELIMITED) {
+      const [nextPos, ok] = skipProtoFieldValue(payload, pos, wireType);
+      if (!ok) break;
+      pos = nextPos;
+      continue;
+    }
+
+    const [data, nextPos, ok] = readLengthDelimited(payload, pos);
+    if (!ok) break;
+    pos = nextPos;
+
+    if (fieldNum === CURSOR_ASM_INTERACTION_UPDATE) {
+      events.push(...decodeCursorInteractionUpdate(data, state));
+    } else if (fieldNum === CURSOR_ASM_CONVERSATION_CHECKPOINT) {
+      events.push({ type: "checkpoint", bytes: Buffer.from(data) });
+    } else if (fieldNum === CURSOR_ASM_KV_SERVER_MESSAGE) {
+      events.push({ type: "kv_server_message", bytes: Buffer.from(data) });
+    } else if (fieldNum === CURSOR_ASM_EXEC_SERVER_MESSAGE) {
+      events.push({ type: "exec_server_message", bytes: Buffer.from(data) });
+    }
+  }
+
+  return events;
+}
+
+function parseConnectEndStream(payload) {
+  if (!payload || payload.length === 0) return null;
+  let trailer;
+  try {
+    trailer = JSON.parse(payload.toString("utf8"));
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    return new Error(`Cursor direct Connect end-stream parse failed: ${message}`);
+  }
+
+  const trailerError = trailer?.error;
+  if (!trailerError) return null;
+  const code = String(trailerError.code || "unknown");
+  const message = String(trailerError.message || "Unknown error");
+  const error = new Error(`Cursor direct Connect error ${code}: ${message}`);
+  error.code = code;
+  return error;
+}
+
+function parseConnectFrames(data, options = {}) {
+  const parser = createConnectFrameParser(options);
+  return parser.push(data);
+}
+
+function createConnectFrameParser(options = {}) {
+  const state = createParseState(options);
+  let pending = Buffer.alloc(0);
+  let frameIndex = 0;
+  let bufferedBytes = 0;
+
+  return {
+    push(chunk) {
+      const input = Buffer.from(chunk || Buffer.alloc(0));
+      if (input.length <= 0) return [];
+      bufferedBytes += input.length;
+      if (bufferedBytes > state.limits.maxTotalBytes) {
+        pending = Buffer.alloc(0);
+        throw new Error(`Cursor direct response exceeded parse limit (${state.limits.maxTotalBytes} bytes)`);
+      }
+
+      pending = pending.length > 0 ? Buffer.concat([pending, input]) : input;
+      const events = [];
+      let offset = 0;
+
+      while (offset + 5 <= pending.length) {
+        if (state.fields >= state.limits.maxFields || state.strings >= state.limits.maxStrings) break;
+        const flags = pending[offset];
+        const length = pending.readUInt32BE(offset + 1);
+        if (length > state.limits.maxFrameBytes) {
+          pending = Buffer.alloc(0);
+          throw new Error(`Cursor direct frame exceeded parse limit (${state.limits.maxFrameBytes} bytes)`);
+        }
+        if (offset + 5 + length > pending.length) break;
+        let payload = pending.subarray(offset + 5, offset + 5 + length);
+        if (flags & CONNECT_COMPRESSION_FLAG) {
+          try {
+            payload = zlib.gunzipSync(payload);
+          } catch {
+            // keep the original payload
+          }
+        }
+
+        if (flags & CONNECT_END_STREAM_FLAG) {
+          const trailerError = parseConnectEndStream(payload);
+          if (trailerError) {
+            pending = Buffer.alloc(0);
+            throw trailerError;
+          }
+          offset += 5 + length;
+          frameIndex += 1;
+          continue;
+        }
+
+        let eventIndex = 0;
+        for (const event of decodeCursorServerMessage(payload, { state })) {
+          if (event.type === "text_delta") {
+            events.push({
+              ...event,
+              fieldPath: "1.1.1",
+              depth: 2,
+              frameIndex,
+              eventIndex,
+            });
+            state.strings += 1;
+          } else if (options.includeNonTextEvents) {
+            events.push({ ...event, frameIndex, eventIndex });
+          }
+          eventIndex += 1;
+        }
+        offset += 5 + length;
+        frameIndex += 1;
+      }
+
+      pending = offset > 0 ? pending.subarray(offset) : pending;
+      return events;
+    },
+    finish() {
+      return { pendingBytes: pending.length, frameIndex };
+    },
+  };
 }
 
 function looksLikeOpaqueToken(text) {
@@ -1052,7 +1458,24 @@ function looksLikeOpaqueToken(text) {
   return false;
 }
 
+function looksLikeProtocolLabel(text) {
+  const value = text.trim();
+  if (/^[A-Za-z0-9][A-Za-z0-9_.-]{0,79}\.[A-Za-z0-9]{1,8}$/.test(value)) return true;
+  if (/^The user (asks|wants|is|has|greets|requests|provided|said|needs)\b/i.test(value)) return true;
+  if (/^["'`“”‘’]{2}\s+in\s+[A-Za-z][A-Za-z -]{1,40}\.?$/u.test(value)) return true;
+  if (/^["'`“”‘’][^"'`“”‘’]{0,120}["'`“”‘’]\s+in\s+[A-Za-z][A-Za-z -]{1,40}\.?$/u.test(value)) return true;
+  return false;
+}
+
+function countLettersAndNumbers(text) {
+  return (String(text || "").match(/[\p{L}\p{N}]/gu) || []).length;
+}
+
 function pickAssistantCandidate(strings, options = {}) {
+  return pickAssistantText(strings, options);
+}
+
+function getAssistantCandidates(strings, options = {}) {
   const prompt = String(options.prompt || "");
   const model = String(options.model || "");
   const ignoredExact = new Set([
@@ -1069,6 +1492,8 @@ function pickAssistantCandidate(strings, options = {}) {
       if (!item.text || item.text.length > 12000) return false;
       if (ignoredExact.has(item.text)) return false;
       if (looksLikeOpaqueToken(item.text)) return false;
+      if (looksLikeProtocolLabel(item.text)) return false;
+      if (countLettersAndNumbers(item.text) === 0) return false;
       if (/^(cli|true|false|ok)$/i.test(item.text)) return false;
       if (item.text.includes("<user_query>")) return false;
       if (item.text.includes('"role"') || item.text.includes("providerOptions")) return false;
@@ -1076,16 +1501,168 @@ function pickAssistantCandidate(strings, options = {}) {
       return true;
     })
     .map((item) => {
-      let score = item.frameIndex * 20 + item.depth;
+      const letterNumberCount = countLettersAndNumbers(item.text);
+      let score = item.frameIndex * 2 + item.depth;
       if (item.text.includes(" ")) score += 20;
       if (/[.!?。！？]$/.test(item.text)) score += 15;
       score += Math.min(item.text.length, 600);
-      if (item.text.length <= 3) score += 10;
+      score += Math.min(letterNumberCount * 2, 400);
+      if (item.text.length <= 3) score -= 50;
       return { ...item, score };
     })
     .sort((a, b) => b.score - a.score);
 
-  return candidates[0]?.text || "";
+  return candidates;
+}
+
+function commonSuffixPrefixLength(left, right) {
+  const max = Math.min(left.length, right.length);
+  for (let size = max; size >= 1; size -= 1) {
+    if (left.slice(-size) === right.slice(0, size)) return size;
+  }
+  return 0;
+}
+
+function normalizeComparableText(text) {
+  return String(text || "")
+    .normalize("NFKC")
+    .replace(/\s+/g, "")
+    .replace(/[^\p{L}\p{N}]+/gu, "");
+}
+
+function countOccurrences(haystack, needle) {
+  if (!haystack || !needle) return 0;
+  let count = 0;
+  let index = 0;
+  while (index >= 0) {
+    index = haystack.indexOf(needle, index);
+    if (index < 0) break;
+    count += 1;
+    index += Math.max(1, needle.length);
+  }
+  return count;
+}
+
+function isCjkTextChar(value) {
+  return /[\u3040-\u30ff\u3400-\u9fff\uf900-\ufaff\uac00-\ud7af]/u.test(value);
+}
+
+function shouldInsertFragmentSpace(output, fragment) {
+  if (/\s$/.test(output) || /^\s/.test(fragment)) return false;
+  if (/^[,.;:!?)}\]\u3001\u3002\uff0c\uff01\uff1f\uff1b\uff1a\uff09\u3011\u300d\u300f]/u.test(fragment)) return false;
+  const left = Array.from(output).pop() || "";
+  const right = Array.from(fragment)[0] || "";
+  if (isCjkTextChar(left) || isCjkTextChar(right)) return false;
+  return true;
+}
+
+function appendAssistantFragment(output, fragment) {
+  if (!fragment) return output;
+  if (!output) return fragment;
+  if (output === fragment || output.endsWith(fragment)) return output;
+  if (fragment.startsWith(output)) return fragment;
+
+  const outputComparable = normalizeComparableText(output);
+  const fragmentComparable = normalizeComparableText(fragment);
+  if (fragmentComparable && outputComparable.includes(fragmentComparable)) return output;
+  if (outputComparable && fragmentComparable.startsWith(outputComparable)) return fragment;
+
+  const overlap = commonSuffixPrefixLength(output, fragment);
+  if (overlap > 0) return output + fragment.slice(overlap);
+
+  const needsSpace = shouldInsertFragmentSpace(output, fragment);
+  return `${output}${needsSpace ? " " : ""}${fragment}`;
+}
+
+function appendAssistantFragmentWithDelta(output, fragment) {
+  const nextText = appendAssistantFragment(output, fragment);
+  if (nextText === output) return { text: output, delta: "" };
+  if (!output) return { text: nextText, delta: nextText };
+  if (nextText.startsWith(output)) return { text: nextText, delta: nextText.slice(output.length) };
+  return { text: nextText, delta: nextText };
+}
+
+function pickAssistantText(strings, options = {}) {
+  const candidates = getAssistantCandidates(strings, options);
+  if (candidates.length === 0) return "";
+
+  const bestByFrame = new Map();
+  for (const candidate of candidates) {
+    const previous = bestByFrame.get(candidate.frameIndex);
+    if (!previous || candidate.score > previous.score) {
+      bestByFrame.set(candidate.frameIndex, candidate);
+    }
+  }
+
+  const ordered = Array.from(bestByFrame.values())
+    .sort((a, b) => (a.frameIndex - b.frameIndex) || (a.depth - b.depth) || a.fieldPath.localeCompare(b.fieldPath));
+
+  let merged = "";
+  for (const item of ordered) {
+    merged = appendAssistantFragment(merged, item.text);
+  }
+
+  const bestSingle = candidates[0]?.text || "";
+  const mergedComparable = normalizeComparableText(merged);
+  const bestComparable = normalizeComparableText(bestSingle);
+  if (
+    bestSingle.length >= 20 &&
+    bestComparable.length >= 12 &&
+    countOccurrences(mergedComparable, bestComparable) > 1
+  ) {
+    return bestSingle;
+  }
+
+  return merged.length >= bestSingle.length ? merged : bestSingle;
+}
+
+function createAssistantTextAccumulator(options = {}) {
+  const state = { text: "", lastFrameIndex: -1 };
+  return {
+    get text() {
+      return state.text;
+    },
+    pushStrings(strings = []) {
+      const textDeltas = strings
+        .filter((item) => item?.type === "text_delta" && typeof item.text === "string")
+        .sort((a, b) => (
+          (a.frameIndex - b.frameIndex)
+          || ((a.eventIndex ?? 0) - (b.eventIndex ?? 0))
+        ));
+      if (textDeltas.length > 0) {
+        const deltas = [];
+        for (const item of textDeltas) {
+          if (item.frameIndex < state.lastFrameIndex) continue;
+          const next = appendAssistantFragmentWithDelta(state.text, item.text);
+          state.text = next.text;
+          state.lastFrameIndex = Math.max(state.lastFrameIndex, item.frameIndex);
+          if (next.delta) deltas.push(next.delta);
+        }
+        return deltas;
+      }
+
+      const candidates = getAssistantCandidates(strings, options);
+      const bestByFrame = new Map();
+      for (const candidate of candidates) {
+        const previous = bestByFrame.get(candidate.frameIndex);
+        if (!previous || candidate.score > previous.score) {
+          bestByFrame.set(candidate.frameIndex, candidate);
+        }
+      }
+
+      const ordered = Array.from(bestByFrame.values())
+        .sort((a, b) => (a.frameIndex - b.frameIndex) || (a.depth - b.depth) || a.fieldPath.localeCompare(b.fieldPath));
+      const deltas = [];
+      for (const item of ordered) {
+        if (item.frameIndex < state.lastFrameIndex) continue;
+        const next = appendAssistantFragmentWithDelta(state.text, item.text);
+        state.text = next.text;
+        state.lastFrameIndex = Math.max(state.lastFrameIndex, item.frameIndex);
+        if (next.delta) deltas.push(next.delta);
+      }
+      return deltas;
+    },
+  };
 }
 
 function extractTextContent(content) {
@@ -1132,16 +1709,33 @@ function runDirectCompletion(prompt, model, options = {}) {
     const started = Date.now();
     const client = http2.connect(`https://${config.agentHost}`);
     const payload = createConnectFrame(buildDirectRunPayload(prompt, model));
-    let responseData = Buffer.alloc(0);
+    const parser = createConnectFrameParser();
+    const accumulator = createAssistantTextAccumulator({ prompt, model });
+    let responseBytes = 0;
+    let stringCount = 0;
+    let deltaCount = 0;
     let status = 0;
     let settled = false;
     let idleTimer = null;
+    let hardTimer = null;
     let request = null;
+    let emittedContent = false;
+    let abortHandler = null;
+
+    const makeError = (message, errorOptions = {}) => {
+      const error = new Error(message);
+      error.beforeFirstPayload = errorOptions.beforeFirstPayload ?? !emittedContent;
+      return error;
+    };
 
     const settle = (fn, value) => {
       if (settled) return;
       settled = true;
       clearTimeout(idleTimer);
+      clearTimeout(hardTimer);
+      if (options.signal && abortHandler) {
+        options.signal.removeEventListener("abort", abortHandler);
+      }
       if (request) {
         try {
           request.close();
@@ -1159,27 +1753,53 @@ function runDirectCompletion(prompt, model, options = {}) {
       fn(value);
     };
 
-    const finishWithCurrentData = () => {
-      const strings = parseConnectFrames(responseData);
-      const text = pickAssistantCandidate(strings, { prompt, model });
+    const emitDeltas = (strings) => {
+      stringCount += strings.length;
+      const deltas = accumulator.pushStrings(strings);
+      for (const delta of deltas) {
+        if (!delta) continue;
+        emittedContent = true;
+        deltaCount += 1;
+        if (typeof options.onDelta === "function") {
+          options.onDelta(delta, { text: accumulator.text, status, bytes: responseBytes });
+        }
+      }
+    };
+
+    const finishWithCurrentData = (reason = "complete") => {
+      const text = accumulator.text;
       if (status && status !== 200) {
-        settle(reject, new Error(`Cursor direct HTTP ${status}`));
+        settle(reject, makeError(`Cursor direct HTTP ${status}`));
         return;
       }
       if (!text) {
-        settle(reject, new Error(`Cursor direct returned no assistant text (${responseData.length} bytes)`));
+        const suffix = reason === "hard-timeout" ? " before timeout" : "";
+        settle(reject, makeError(`Cursor direct returned no assistant text${suffix} (${responseBytes} bytes)`));
         return;
       }
       settle(resolve, {
         text,
         status,
         durationMs: Date.now() - started,
-        bytes: responseData.length,
-        stringCount: strings.length,
+        bytes: responseBytes,
+        stringCount,
+        deltaCount,
       });
     };
 
-    const hardTimeout = setTimeout(finishWithCurrentData, Math.max(1000, config.hardTimeoutMs));
+    if (options.signal?.aborted) {
+      settle(reject, makeError("Cursor direct request was cancelled"));
+      return;
+    }
+
+    if (options.signal) {
+      abortHandler = () => {
+        settle(reject, makeError("Cursor direct request was cancelled"));
+      };
+      options.signal.addEventListener("abort", abortHandler, { once: true });
+    }
+
+    hardTimer = setTimeout(() => finishWithCurrentData("hard-timeout"), Math.max(1000, config.hardTimeoutMs));
 
     request = client.request({
       ":method": "POST",
@@ -1200,52 +1820,89 @@ function runDirectCompletion(prompt, model, options = {}) {
       status = Number(headers[":status"] || 0);
     });
     request.on("data", (chunk) => {
-      responseData = Buffer.concat([responseData, chunk]);
+      responseBytes += chunk.length;
+      try {
+        emitDeltas(parser.push(chunk));
+      } catch (error) {
+        settle(reject, makeError(error instanceof Error ? error.message : String(error)));
+        return;
+      }
       clearTimeout(idleTimer);
       idleTimer = setTimeout(() => {
-        clearTimeout(hardTimeout);
         finishWithCurrentData();
       }, Math.max(250, config.idleMs));
     });
     request.on("end", () => {
-      clearTimeout(hardTimeout);
       finishWithCurrentData();
     });
     request.on("error", (error) => {
-      clearTimeout(hardTimeout);
+      error.beforeFirstPayload = !emittedContent;
       settle(reject, error);
     });
     client.on("error", (error) => {
-      clearTimeout(hardTimeout);
+      error.beforeFirstPayload = !emittedContent;
       settle(reject, error);
     });
     request.end(payload);
   });
 }
 
-async function runDirectCompletionFromPool(prompt, model, options = {}) {
-  const selection = await selectAndRefreshDirectAccount({ accountId: options.accountId });
-  try {
-    const result = await runDirectCompletion(prompt, model, { accessToken: selection.account.accessToken });
-    markDirectAccountResult(selection, true, { outputChars: result.text.length });
-    return {
-      ...result,
-      account: summarizeDirectAccount(selection.account),
-      accountId: selection.account.id,
-    };
-  } catch (error) {
-    markDirectAccountResult(selection, false, { error: error instanceof Error ? error.message : String(error) });
-    throw error;
+async function runDirectCompletionWithRetry(prompt, model, options = {}) {
+  const selectAccount = options.selectAccount || selectAndRefreshDirectAccount;
+  const runAttempt = options.runAttempt || runDirectCompletion;
+  const markResult = options.markResult || markDirectAccountResult;
+  const maxAttempts = Math.max(1, Number(options.maxAttempts || (options.accountId ? 1 : 2)));
+  let lastError = null;
+
+  for (let attempt = 0; attempt < maxAttempts; attempt += 1) {
+    const pinnedAccountId = attempt === 0 ? options.accountId : "";
+    const selection = await selectAccount({ accountId: pinnedAccountId || "", force: options.force });
+    let emittedOnAttempt = false;
+    try {
+      const result = await runAttempt(prompt, model, {
+        accessToken: selection.account.accessToken,
+        account: selection.account,
+        signal: options.signal,
+        onDelta: (delta, meta) => {
+          emittedOnAttempt = emittedOnAttempt || Boolean(delta);
+          options.onDelta?.(delta, meta);
+        },
+      });
+      markResult(selection, true, { outputChars: result.text.length });
+      return {
+        ...result,
+        account: summarizeDirectAccount(selection.account),
+        accountId: selection.account.id,
+      };
+    } catch (error) {
+      lastError = error;
+      markResult(selection, false, { error: error instanceof Error ? error.message : String(error) });
+      const beforeFirstPayload = error?.beforeFirstPayload !== false && !emittedOnAttempt;
+      const canRetry = !options.accountId && beforeFirstPayload && attempt + 1 < maxAttempts;
+      if (!canRetry) throw error;
+      log("debug", "retrying cursor direct request before first payload", {
+        attempt: attempt + 1,
+        accountId: selection.account?.id || "",
+        error: error instanceof Error ? error.message : String(error),
+      });
+    }
   }
+
+  throw lastError || new Error("Cursor direct request failed");
 }
 
-function beginTrackedRequest(model, promptChars) {
+async function runDirectCompletionFromPool(prompt, model, options = {}) {
+  return runDirectCompletionWithRetry(prompt, model, options);
+}
+
+function beginTrackedRequest(model, promptChars, options = {}) {
   const started = Date.now();
   stats.totalRequests += 1;
   stats.activeRequests += 1;
   stats.lastModel = model;
   stats.lastPromptChars = promptChars;
   stats.lastRequestAt = started;
+  stats.lastStream = Boolean(options.stream);
 
   let finished = false;
   return (ok, details = {}) => {
@@ -1258,6 +1915,9 @@ function beginTrackedRequest(model, promptChars) {
       stats.successRequests += 1;
       stats.totalDurationMs += duration;
       stats.lastOutputChars = Number(details.outputChars) || 0;
+      stats.lastUpstreamBytes = Number(details.upstreamBytes) || 0;
+      stats.lastStringCount = Number(details.stringCount) || 0;
+      stats.lastDeltaCount = Number(details.deltaCount) || 0;
     } else {
       stats.failedRequests += 1;
       stats.lastError = String(details.error || "unknown error").slice(0, 600);
@@ -1304,6 +1964,16 @@ function createChunk(id, model, delta, done = false) {
 
 function sse(payload) {
   return `data: ${JSON.stringify(payload)}\n\n`;
+}
+
+function flushResponse(res) {
+  if (typeof res.flushHeaders === "function") {
+    try {
+      res.flushHeaders();
+    } catch {
+      // ignore flush errors on already-closed responses
+    }
+  }
 }
 
 function html(status, body) {
@@ -1413,7 +2083,17 @@ function buildDirectAdminStatusPayload() {
       clientVersion: config.clientVersion,
       idleMs: config.idleMs,
       hardTimeoutMs: config.hardTimeoutMs,
+      streamKeepAliveMs: config.streamKeepAliveMs,
       modelsCacheTtlMs: config.modelsCacheTtlMs,
+      authSummaryCacheTtlMs: config.authSummaryCacheTtlMs,
+      oauthSessionCacheTtlMs: config.oauthSessionCacheTtlMs,
+      parseMaxDepth: config.parseMaxDepth,
+      parseMaxFields: config.parseMaxFields,
+      parseMaxStrings: config.parseMaxStrings,
+      parseMaxStringBytes: config.parseMaxStringBytes,
+      parseMaxNestedBytes: config.parseMaxNestedBytes,
+      parseMaxFrameBytes: config.parseMaxFrameBytes,
+      parseMaxTotalBytes: config.parseMaxTotalBytes,
     },
   };
 }
@@ -1504,8 +2184,7 @@ async function handle(req, res) {
         const body = await readRequestBody(req);
         const result = importDirectAccounts(readAccountsStore(), body);
         const store = writeAccountsStore(result.store);
-        modelCache.expiresAt = 0;
-        modelCache.models = [];
+        invalidateDirectMetadataCaches();
         const response = json(200, {
           ok: true,
           imported: result.summaries,
@@ -1533,8 +2212,7 @@ async function handle(req, res) {
             accounts: store.accounts.filter((account) => account.id !== accountId),
             nextIndex: 0,
           });
-          modelCache.expiresAt = 0;
-          modelCache.models = [];
+          invalidateDirectMetadataCaches();
           const response = json(200, { ok: true, accounts: summarizeAccountsStore(nextStore) });
           res.writeHead(response.status, response.headers);
           res.end(response.body);
@@ -1548,6 +2226,7 @@ async function handle(req, res) {
             updatedAt: Date.now(),
           }));
           if (!updated) throw new Error(`Cursor direct account not found: ${accountId}`);
+          invalidateDirectMetadataCaches();
           const response = json(200, {
             ok: true,
             account: summarizeDirectAccount(updated),
@@ -1564,6 +2243,7 @@ async function handle(req, res) {
           if (!account) throw new Error(`Cursor direct account not found: ${accountId}`);
           const refreshed = await refreshDirectAccount(account, { force: true });
           const updated = updateStoredDirectAccount(accountId, () => refreshed);
+          invalidateDirectMetadataCaches();
           const response = json(200, {
             ok: true,
             refreshed: Boolean(refreshed.refreshed),
@@ -1587,11 +2267,7 @@ async function handle(req, res) {
     }
 
     if (url.pathname === "/direct-admin/api/oauth/session" && req.method === "GET") {
-      const response = json(200, {
-        ok: true,
-        session: getOAuthSessionSnapshot(),
-        accounts: summarizeAccountsStore(readAccountsStore()),
-      });
+      const response = json(200, getOAuthSessionPayload());
       res.writeHead(response.status, response.headers);
       res.end(response.body);
       return;
@@ -1646,8 +2322,7 @@ async function handle(req, res) {
         const result = importDirectAccounts(readAccountsStore(), body);
         if (result.imported.length === 0) throw new Error("No accounts found in request body");
         const store = writeAccountsStore(result.store);
-        modelCache.expiresAt = 0;
-        modelCache.models = [];
+        invalidateDirectMetadataCaches();
         const response = json(200, {
           ok: true,
           account: result.summaries[0],
@@ -1671,6 +2346,7 @@ async function handle(req, res) {
           force: true,
           accountId: body?.accountId || body?.id || url.searchParams.get("accountId") || "",
         });
+        invalidateDirectMetadataCaches();
         const response = json(200, {
           ok: true,
           refreshed: Boolean(result.account?.refreshed),
@@ -1729,8 +2405,7 @@ async function handle(req, res) {
       stopDirectOAuthSession("idle");
       clearAuthFile();
       clearAccountsStore();
-      modelCache.expiresAt = 0;
-      modelCache.models = [];
+      invalidateDirectMetadataCaches();
       const response = json(200, { ok: true, account: await readAndSummarizeAuth() });
       res.writeHead(response.status, response.headers);
       res.end(response.body);
@@ -1787,14 +2462,26 @@ async function handle(req, res) {
     const messages = Array.isArray(body?.messages) ? body.messages : [];
     const model = normalizeDirectModel(body?.model);
     const prompt = buildPromptFromMessages(messages);
-    const finishRequest = beginTrackedRequest(model, prompt.length);
+    const streamRequested = body?.stream === true;
+    const finishRequest = beginTrackedRequest(model, prompt.length, { stream: streamRequested });
+    log("info", "chat completion request", {
+      model: displayModelId(model),
+      stream: streamRequested,
+      messages: messages.length,
+      promptChars: prompt.length,
+      userAgent: String(req.headers["user-agent"] || "").slice(0, 120),
+    });
 
-    try {
-      const result = await runDirectCompletionFromPool(prompt, model);
-      finishRequest(true, { outputChars: result.text.length });
+    if (streamRequested) {
+      const id = `cursor-direct-${Date.now()}`;
+      const controller = new AbortController();
+      let responseStarted = false;
+      let responseDone = false;
+      let streamedChars = 0;
 
-      if (body?.stream === true) {
-        const id = `cursor-direct-${Date.now()}`;
+      const startStream = () => {
+        if (responseStarted || res.destroyed) return;
+        responseStarted = true;
         res.writeHead(200, {
           "content-type": "text/event-stream; charset=utf-8",
           "cache-control": "no-cache",
@@ -1802,12 +2489,104 @@ async function handle(req, res) {
           "access-control-allow-origin": "*",
         });
         res.write(sse(createChunk(id, model, { role: "assistant" })));
-        res.write(sse(createChunk(id, model, { content: result.text })));
+        flushResponse(res);
+      };
+
+      const keepAliveMs = Math.max(0, config.streamKeepAliveMs);
+      const keepAliveTimer = keepAliveMs > 0
+        ? setInterval(() => {
+          if (responseDone || res.destroyed) return;
+          startStream();
+          res.write(": keep-alive\n\n");
+          flushResponse(res);
+        }, keepAliveMs)
+        : null;
+
+      const cancelOnClose = () => {
+        if (!responseDone) controller.abort();
+      };
+      res.on("close", cancelOnClose);
+
+      try {
+        const result = await runDirectCompletionFromPool(prompt, model, {
+          signal: controller.signal,
+          onDelta: (delta) => {
+            if (!delta || res.destroyed) return;
+            startStream();
+            streamedChars += delta.length;
+            res.write(sse(createChunk(id, model, { content: delta })));
+            flushResponse(res);
+          },
+        });
+        if (keepAliveTimer) clearInterval(keepAliveTimer);
+        finishRequest(true, {
+          outputChars: result.text.length,
+          upstreamBytes: result.bytes,
+          stringCount: result.stringCount,
+          deltaCount: result.deltaCount,
+        });
+        log("info", "chat completion response", {
+          model: displayModelId(model),
+          stream: true,
+          outputChars: result.text.length,
+          upstreamBytes: result.bytes,
+          stringCount: result.stringCount,
+          deltaCount: result.deltaCount,
+          streamedChars,
+          durationMs: result.durationMs,
+          accountId: result.accountId || "",
+        });
+        if (res.destroyed) return;
+        startStream();
+        if (streamedChars === 0 && result.text) {
+          streamedChars += result.text.length;
+          res.write(sse(createChunk(id, model, { content: result.text })));
+        }
         res.write(sse(createChunk(id, model, {}, true)));
         res.write("data: [DONE]\n\n");
+        responseDone = true;
         res.end();
-        return;
+      } catch (error) {
+        if (keepAliveTimer) clearInterval(keepAliveTimer);
+        const message = error instanceof Error ? error.message : String(error);
+        finishRequest(false, { error: message });
+        if (res.destroyed) return;
+        if (responseStarted) {
+          res.write(sse({ error: { message, type: "upstream_error" } }));
+          res.write("data: [DONE]\n\n");
+          responseDone = true;
+          res.end();
+        } else {
+          const response = openAiError(502, "upstream_error", message);
+          responseDone = true;
+          res.writeHead(response.status, response.headers);
+          res.end(response.body);
+        }
+      } finally {
+        if (keepAliveTimer) clearInterval(keepAliveTimer);
+        res.off("close", cancelOnClose);
       }
+      return;
+    }
+
+    try {
+      const result = await runDirectCompletionFromPool(prompt, model);
+      finishRequest(true, {
+        outputChars: result.text.length,
+        upstreamBytes: result.bytes,
+        stringCount: result.stringCount,
+        deltaCount: result.deltaCount,
+      });
+      log("info", "chat completion response", {
+        model: displayModelId(model),
+        stream: false,
+        outputChars: result.text.length,
+        upstreamBytes: result.bytes,
+        stringCount: result.stringCount,
+        deltaCount: result.deltaCount,
+        durationMs: result.durationMs,
+        accountId: result.accountId || "",
+      });
 
       const response = json(200, createChatCompletion(model, result.text, prompt));
       res.writeHead(response.status, response.headers);
@@ -1832,14 +2611,22 @@ export {
   buildDirectAdminStatusPayload,
   buildPromptFromMessages,
   createLegacyDirectAccount,
+  createAssistantTextAccumulator,
+  createConnectFrameParser,
+  createDirectMetadataCaches,
   extractStringsFromProtobuf,
   generateChecksum,
+  getMetadataCache,
   importDirectAccounts,
+  invalidateDirectMetadataCaches,
   isDirectAdminAuthorized,
   listDirectModels,
   normalizeDirectModel,
   pickAssistantCandidate,
+  pickAssistantText,
+  runDirectCompletionWithRetry,
   selectDirectAccount,
+  setMetadataCache,
   summarizeCursorAuth,
   summarizeDirectAccount,
   runDirectCompletion,
