@@ -25,6 +25,7 @@ const config = {
   host: process.env.CURSOR_DIRECT_HOST || "127.0.0.1",
   port: Number(process.env.CURSOR_DIRECT_PORT || "32126"),
   apiKey: process.env.CURSOR_DIRECT_API_KEY || process.env.CURSOR_GATEWAY_API_KEY || "",
+  publicBaseUrl: process.env.CURSOR_DIRECT_PUBLIC_BASE_URL || "",
   adminPassword:
     process.env.CURSOR_DIRECT_ADMIN_PASSWORD ||
     process.env.CURSOR_GATEWAY_ADMIN_PASSWORD ||
@@ -222,7 +223,28 @@ function normalizeDirectModel(model) {
     .replace(/^cursor-acp\//, "")
     .replace(/^cursor\//, "")
     .replace(/^cursor-/, "");
+  const anthropicAlias = normalizeAnthropicModelAlias(cleaned);
+  if (anthropicAlias) return anthropicAlias;
   return cleaned === "auto" ? "default" : cleaned;
+}
+
+function normalizeAnthropicModelAlias(model) {
+  const text = String(model || "").trim().toLowerCase();
+  if (!text.startsWith("claude-")) return "";
+
+  const familyFirst = text.match(/^claude-(opus|sonnet|haiku)-(\d+)(?:[-.](\d+))?/);
+  if (familyFirst) {
+    const [, family, major, minor] = familyFirst;
+    return `${family}-${major}${minor ? `.${minor}` : ""}`;
+  }
+
+  const versionFirst = text.match(/^claude-(\d+)(?:[-.](\d+))?-(opus|sonnet|haiku)/);
+  if (versionFirst) {
+    const [, major, minor, family] = versionFirst;
+    if (Number(major) >= 4) return `${family}-${major}${minor ? `.${minor}` : ""}`;
+  }
+
+  return "default";
 }
 
 function displayModelId(model) {
@@ -2090,6 +2112,40 @@ function buildPromptFromMessages(messages) {
   return lines.join("\n\n").trim() || "Hello";
 }
 
+function extractClaudeTextContent(content) {
+  if (typeof content === "string") return content;
+  if (Array.isArray(content)) {
+    return content
+      .map((part) => extractClaudeTextContent(part))
+      .filter(Boolean)
+      .join("\n");
+  }
+  if (content && typeof content === "object") {
+    if (typeof content.text === "string") return content.text;
+    if (typeof content.content === "string" || Array.isArray(content.content)) {
+      return extractClaudeTextContent(content.content);
+    }
+    return "";
+  }
+  if (content == null) return "";
+  return String(content);
+}
+
+function buildPromptFromClaudeMessages(messages, system = undefined) {
+  const lines = [];
+  const systemText = extractClaudeTextContent(system).trim();
+  if (systemText) lines.push(`SYSTEM: ${systemText}`);
+
+  for (const message of Array.isArray(messages) ? messages : []) {
+    const role = typeof message?.role === "string" ? message.role : "user";
+    const content = extractClaudeTextContent(message?.content).trim();
+    if (!content) continue;
+    lines.push(`${role.toUpperCase()}: ${content}`);
+  }
+
+  return lines.join("\n\n").trim() || "Hello";
+}
+
 function runDirectCompletion(prompt, model, options = {}) {
   return new Promise(async (resolve, reject) => {
     let token;
@@ -2367,6 +2423,31 @@ function createChunk(id, model, delta, done = false) {
   };
 }
 
+function estimateClaudeUsage(prompt, output) {
+  const usage = estimateUsage(prompt, output);
+  return {
+    input_tokens: usage.prompt_tokens,
+    output_tokens: usage.completion_tokens,
+  };
+}
+
+function createClaudeMessage(model, content, prompt, options = {}) {
+  return {
+    id: options.id || `msg_cursor_direct_${Date.now()}`,
+    type: "message",
+    role: "assistant",
+    model: options.publicModel || displayModelId(model),
+    content: [{ type: "text", text: content }],
+    stop_reason: "end_turn",
+    stop_sequence: null,
+    usage: estimateClaudeUsage(prompt, content),
+  };
+}
+
+function createClaudeStreamEvent(event, payload) {
+  return `event: ${event}\ndata: ${JSON.stringify(payload)}\n\n`;
+}
+
 function sse(payload) {
   return `data: ${JSON.stringify(payload)}\n\n`;
 }
@@ -2387,7 +2468,7 @@ function html(status, body) {
     headers: {
       "content-type": "text/html; charset=utf-8",
       "access-control-allow-origin": "*",
-      "access-control-allow-headers": "authorization,content-type,x-api-key,x-admin-password",
+      "access-control-allow-headers": "authorization,content-type,x-api-key,x-admin-password,anthropic-version,anthropic-beta",
       "access-control-allow-methods": "GET,POST,DELETE,OPTIONS",
     },
     body,
@@ -2400,7 +2481,7 @@ function json(status, payload) {
     headers: {
       "content-type": "application/json; charset=utf-8",
       "access-control-allow-origin": "*",
-      "access-control-allow-headers": "authorization,content-type,x-api-key,x-admin-password",
+      "access-control-allow-headers": "authorization,content-type,x-api-key,x-admin-password,anthropic-version,anthropic-beta",
       "access-control-allow-methods": "GET,POST,DELETE,OPTIONS",
     },
     body: JSON.stringify(payload),
@@ -2438,6 +2519,42 @@ function isAdminAuthorized(req) {
   return isDirectAdminAuthorized(req);
 }
 
+function firstHeaderValue(value) {
+  const raw = Array.isArray(value) ? value[0] : value;
+  return String(raw || "").split(",")[0].trim();
+}
+
+function getPublicOrigin(req) {
+  const configured = String(config.publicBaseUrl || "").trim();
+  if (configured) {
+    try {
+      const parsed = new URL(configured);
+      return parsed.origin;
+    } catch {
+      return configured.replace(/\/v1\/?$/, "").replace(/\/+$/, "");
+    }
+  }
+
+  const headers = req?.headers || {};
+  let host = firstHeaderValue(headers["x-forwarded-host"]) || firstHeaderValue(headers.host);
+  if (!host) return "";
+  if (/^https?:\/\//i.test(host)) return host.replace(/\/+$/, "");
+  const proto = firstHeaderValue(headers["x-forwarded-proto"]) || (req?.socket?.encrypted ? "https" : "http");
+  const port = firstHeaderValue(headers["x-forwarded-port"]);
+  const hasPort = /^\[[^\]]+\]:\d+$/.test(host) || (/:\d+$/.test(host) && !host.includes("]:"));
+  const isDefaultPort = (proto === "http" && port === "80") || (proto === "https" && port === "443");
+  if (port && !hasPort && !isDefaultPort) host = `${host}:${port}`;
+  return `${proto || "http"}://${host}`;
+}
+
+function getPublicBaseUrl(req, apiBasePath = "/v1") {
+  const configured = String(config.publicBaseUrl || "").trim();
+  if (configured) return configured.replace(/\/+$/, "");
+  const origin = getPublicOrigin(req);
+  const path = String(apiBasePath || "/v1").startsWith("/") ? String(apiBasePath || "/v1") : `/${apiBasePath}`;
+  return origin ? `${origin}${path}` : path;
+}
+
 function getMemorySnapshot() {
   const memory = process.memoryUsage();
   return {
@@ -2469,14 +2586,18 @@ function getStatusPayload() {
   };
 }
 
-function buildDirectAdminStatusPayload() {
+function buildDirectAdminStatusPayload(options = {}) {
   const status = getStatusPayload();
+  const apiKey = options.apiKey ?? config.apiKey;
+  const publicBaseUrl = options.publicBaseUrl || config.publicBaseUrl || "";
   return {
     ...status,
     adminPath: "/direct-admin/",
     apiBasePath: "/v1",
     adminPasswordSet: Boolean(config.adminPassword),
-    apiKeyConfigured: Boolean(config.apiKey),
+    apiKeyConfigured: Boolean(apiKey),
+    apiKeyPreview: maskSecret(apiKey, 6),
+    publicBaseUrl,
     apiBaseUrl: config.apiBaseUrl,
     memory: getMemorySnapshot(),
     config: {
@@ -2486,6 +2607,7 @@ function buildDirectAdminStatusPayload() {
       accountsPath: config.accountsPath,
       agentHost: config.agentHost,
       clientVersion: config.clientVersion,
+      publicBaseUrl: config.publicBaseUrl,
       idleMs: config.idleMs,
       hardTimeoutMs: config.hardTimeoutMs,
       streamKeepAliveMs: config.streamKeepAliveMs,
@@ -2503,6 +2625,19 @@ function buildDirectAdminStatusPayload() {
   };
 }
 
+function buildDirectAdminClientConfig(options = {}) {
+  const apiKey = options.apiKey ?? config.apiKey;
+  const publicBaseUrl = options.publicBaseUrl || config.publicBaseUrl || "";
+  return {
+    ok: true,
+    baseUrl: publicBaseUrl,
+    apiBasePath: "/v1",
+    apiKeyConfigured: Boolean(apiKey),
+    apiKeyPreview: maskSecret(apiKey, 6),
+    apiKey: apiKey || "",
+  };
+}
+
 
 async function handle(req, res) {
   const url = new URL(req.url || "/", `http://${req.headers.host || "localhost"}`);
@@ -2510,7 +2645,7 @@ async function handle(req, res) {
   if (req.method === "OPTIONS") {
     res.writeHead(204, {
       "access-control-allow-origin": "*",
-      "access-control-allow-headers": "authorization,content-type,x-api-key,x-admin-password",
+      "access-control-allow-headers": "authorization,content-type,x-api-key,x-admin-password,anthropic-version,anthropic-beta",
       "access-control-allow-methods": "GET,POST,DELETE,OPTIONS",
     });
     res.end();
@@ -2550,7 +2685,18 @@ async function handle(req, res) {
     }
 
     if (url.pathname === "/direct-admin/api/status" && req.method === "GET") {
-      const response = json(200, buildDirectAdminStatusPayload());
+      const response = json(200, buildDirectAdminStatusPayload({
+        publicBaseUrl: getPublicBaseUrl(req),
+      }));
+      res.writeHead(response.status, response.headers);
+      res.end(response.body);
+      return;
+    }
+
+    if (url.pathname === "/direct-admin/api/client-config" && req.method === "GET") {
+      const response = json(200, buildDirectAdminClientConfig({
+        publicBaseUrl: getPublicBaseUrl(req),
+      }));
       res.writeHead(response.status, response.headers);
       res.end(response.body);
       return;
@@ -2856,6 +3002,202 @@ async function handle(req, res) {
     return;
   }
 
+  if ((url.pathname === "/v1/messages" || url.pathname === "/messages") && req.method === "POST") {
+    let body;
+    try {
+      body = await readRequestBody(req);
+    } catch {
+      const response = openAiError(400, "invalid_request_error", "Invalid JSON body");
+      res.writeHead(response.status, response.headers);
+      res.end(response.body);
+      return;
+    }
+
+    const messages = Array.isArray(body?.messages) ? body.messages : [];
+    const requestedModel = typeof body?.model === "string" && body.model.trim() ? body.model.trim() : "claude-sonnet-4-5";
+    const model = normalizeDirectModel(requestedModel);
+    const prompt = buildPromptFromClaudeMessages(messages, body?.system);
+    const streamRequested = body?.stream === true;
+    const finishRequest = beginTrackedRequest(model, prompt.length, { stream: streamRequested });
+    log("info", "claude messages request", {
+      model: displayModelId(model),
+      requestedModel,
+      stream: streamRequested,
+      messages: messages.length,
+      promptChars: prompt.length,
+      userAgent: String(req.headers["user-agent"] || "").slice(0, 120),
+    });
+
+    if (streamRequested) {
+      const id = `msg_cursor_direct_${Date.now()}`;
+      const controller = new AbortController();
+      let responseStarted = false;
+      let responseDone = false;
+      let streamedChars = 0;
+      const keepAliveMs = Math.max(0, Number(config.streamKeepAliveMs || 0));
+
+      const writeClaudeEvent = (event, payload) => {
+        res.write(createClaudeStreamEvent(event, payload));
+      };
+
+      const startStream = () => {
+        if (responseStarted || res.destroyed) return;
+        responseStarted = true;
+        res.writeHead(200, {
+          "content-type": "text/event-stream; charset=utf-8",
+          "cache-control": "no-cache",
+          connection: "keep-alive",
+          "x-accel-buffering": "no",
+          "access-control-allow-origin": "*",
+        });
+        writeClaudeEvent("message_start", {
+          type: "message_start",
+          message: {
+            id,
+            type: "message",
+            role: "assistant",
+            model: requestedModel,
+            content: [],
+            stop_reason: null,
+            stop_sequence: null,
+            usage: {
+              input_tokens: estimateClaudeUsage(prompt, "").input_tokens,
+              output_tokens: 0,
+            },
+          },
+        });
+        writeClaudeEvent("content_block_start", {
+          type: "content_block_start",
+          index: 0,
+          content_block: { type: "text", text: "" },
+        });
+        flushResponse(res);
+      };
+
+      const keepAliveTimer = keepAliveMs > 0
+        ? setInterval(() => {
+          if (!responseDone && responseStarted && !res.destroyed) {
+            writeClaudeEvent("ping", { type: "ping" });
+            flushResponse(res);
+          }
+        }, keepAliveMs)
+        : null;
+
+      const cancelOnClose = () => {
+        if (!responseDone) controller.abort();
+      };
+      res.on("close", cancelOnClose);
+
+      try {
+        startStream();
+        const result = await runDirectCompletionFromPool(prompt, model, {
+          signal: controller.signal,
+          onDelta: (delta) => {
+            if (!delta || res.destroyed) return;
+            startStream();
+            streamedChars += delta.length;
+            writeClaudeEvent("content_block_delta", {
+              type: "content_block_delta",
+              index: 0,
+              delta: { type: "text_delta", text: delta },
+            });
+            flushResponse(res);
+          },
+        });
+        if (keepAliveTimer) clearInterval(keepAliveTimer);
+        finishRequest(true, {
+          outputChars: result.text.length,
+          upstreamBytes: result.bytes,
+          stringCount: result.stringCount,
+          deltaCount: result.deltaCount,
+        });
+        log("info", "claude messages response", {
+          model: displayModelId(model),
+          requestedModel,
+          stream: true,
+          outputChars: result.text.length,
+          upstreamBytes: result.bytes,
+          stringCount: result.stringCount,
+          deltaCount: result.deltaCount,
+          durationMs: result.durationMs,
+          accountId: result.accountId || "",
+        });
+
+        startStream();
+        if (streamedChars === 0 && result.text) {
+          streamedChars += result.text.length;
+          writeClaudeEvent("content_block_delta", {
+            type: "content_block_delta",
+            index: 0,
+            delta: { type: "text_delta", text: result.text },
+          });
+        }
+        writeClaudeEvent("content_block_stop", {
+          type: "content_block_stop",
+          index: 0,
+        });
+        writeClaudeEvent("message_delta", {
+          type: "message_delta",
+          delta: { stop_reason: "end_turn", stop_sequence: null },
+          usage: { output_tokens: estimateClaudeUsage(prompt, result.text).output_tokens },
+        });
+        writeClaudeEvent("message_stop", { type: "message_stop" });
+        responseDone = true;
+        res.end();
+      } catch (error) {
+        if (keepAliveTimer) clearInterval(keepAliveTimer);
+        const message = error instanceof Error ? error.message : String(error);
+        finishRequest(false, { error: message });
+        if (res.destroyed) return;
+        startStream();
+        writeClaudeEvent("error", {
+          type: "error",
+          error: { type: "api_error", message },
+        });
+        responseDone = true;
+        res.end();
+      } finally {
+        if (keepAliveTimer) clearInterval(keepAliveTimer);
+        res.off("close", cancelOnClose);
+      }
+      return;
+    }
+
+    try {
+      const result = await runDirectCompletionFromPool(prompt, model);
+      finishRequest(true, {
+        outputChars: result.text.length,
+        upstreamBytes: result.bytes,
+        stringCount: result.stringCount,
+        deltaCount: result.deltaCount,
+      });
+      log("info", "claude messages response", {
+        model: displayModelId(model),
+        requestedModel,
+        stream: false,
+        outputChars: result.text.length,
+        upstreamBytes: result.bytes,
+        stringCount: result.stringCount,
+        deltaCount: result.deltaCount,
+        durationMs: result.durationMs,
+        accountId: result.accountId || "",
+      });
+
+      const response = json(200, createClaudeMessage(model, result.text, prompt, {
+        publicModel: requestedModel,
+      }));
+      res.writeHead(response.status, response.headers);
+      res.end(response.body);
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      finishRequest(false, { error: message });
+      const response = openAiError(502, "upstream_error", message);
+      res.writeHead(response.status, response.headers);
+      res.end(response.body);
+    }
+    return;
+  }
+
   if ((url.pathname === "/v1/chat/completions" || url.pathname === "/chat/completions") && req.method === "POST") {
     let body;
     try {
@@ -3017,16 +3359,21 @@ async function handle(req, res) {
 export {
   applyDirectCompletionEvents,
   buildDirectAdminHtml,
+  buildDirectAdminClientConfig,
   buildDirectAdminStatusPayload,
+  buildPromptFromClaudeMessages,
   buildPromptFromMessages,
   createLegacyDirectAccount,
   createAssistantTextAccumulator,
+  createClaudeMessage,
+  createClaudeStreamEvent,
   createConnectFrameParser,
   createCursorClientResponsesForEvents,
   createDirectMetadataCaches,
   extractStringsFromProtobuf,
   generateChecksum,
   getMetadataCache,
+  getPublicBaseUrl,
   importDirectAccounts,
   invalidateDirectMetadataCaches,
   isDirectAdminAuthorized,

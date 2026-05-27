@@ -213,6 +213,10 @@ export function buildDirectAdminHtml() {
             <input id="baseUrlInput" readonly />
             <button id="copyBaseHeroBtn" type="button">复制</button>
           </div>
+          <div class="copyline" style="margin-bottom: 12px;">
+            <input id="apiKeyPreview" readonly placeholder="API Key 未配置" />
+            <button id="copyApiKeyBtn" type="button">复制 API Key</button>
+          </div>
           <div class="endpoint-list" id="endpointList"></div>
           <h2 style="margin-top: 18px;">模型列表</h2>
           <div class="table-wrap">
@@ -275,6 +279,7 @@ export function buildDirectAdminHtml() {
       $('oauthStartBtn').disabled = flag;
       $('oauthCheckBtn').disabled = flag;
       $('probeBtn').disabled = flag;
+      $('copyApiKeyBtn').disabled = flag || !(state.status && state.status.apiKeyConfigured);
       $('accountPoolLoading').classList.toggle('hidden', !flag);
     }
     function authHeaders() {
@@ -309,7 +314,10 @@ export function buildDirectAdminHtml() {
       const status = state.status || {};
       const pool = state.accountsPayload || {};
       const stats = status.stats || {};
-      const baseUrl = window.location.origin + (status.apiBasePath || '/v1');
+      const apiBasePath = status.apiBasePath || '/v1';
+      const configuredPublicBaseUrl = status.config && status.config.publicBaseUrl ? status.publicBaseUrl : '';
+      const baseUrl = (configuredPublicBaseUrl || (window.location.origin + apiBasePath)).replace(/\\/+$/, '');
+      const healthUrl = baseUrl.endsWith(apiBasePath) ? baseUrl.slice(0, -apiBasePath.length) + '/health' : (window.location.origin + '/health');
       $('runtimeLine').textContent = [
         status.backend || 'direct',
         status.config && status.config.agentHost ? status.config.agentHost : '',
@@ -329,10 +337,13 @@ export function buildDirectAdminHtml() {
       baseNode.textContent = truncateText(baseUrl, 28);
       baseNode.title = baseUrl;
       $('baseUrlInput').value = baseUrl;
+      $('apiKeyPreview').value = status.apiKeyConfigured ? (status.apiKeyPreview || '已配置，点击复制') : 'API Key 未配置';
+      $('copyApiKeyBtn').disabled = !status.apiKeyConfigured;
       $('endpointList').innerHTML = [
-        renderEndpoint('GET', window.location.origin + '/health'),
+        renderEndpoint('GET', healthUrl),
         renderEndpoint('GET', baseUrl + '/models'),
         renderEndpoint('POST', baseUrl + '/chat/completions'),
+        renderEndpoint('POST', baseUrl + '/messages'),
       ].join('');
       bindCopyButtons($('endpointList'));
       $('debugStatus').value = JSON.stringify(status, null, 2);
@@ -632,6 +643,19 @@ export function buildDirectAdminHtml() {
       const value = $('baseUrlInput').value || (window.location.origin + '/v1');
       await copyText(value, 'Base URL');
     }
+    async function copyApiKey() {
+      try {
+        const result = await api('/client-config');
+        if (result && result.apiKeyPreview) $('apiKeyPreview').value = result.apiKeyPreview;
+        if (!result || !result.apiKey) {
+          showToast('API Key 未配置');
+          return;
+        }
+        await copyText(result.apiKey, 'API Key');
+      } catch (error) {
+        showToast('API Key 复制失败：' + error.message);
+      }
+    }
 
     $('loginBtn').addEventListener('click', login);
     $('adminPassword').addEventListener('keydown', (event) => { if (event.key === 'Enter') login(); });
@@ -654,6 +678,7 @@ export function buildDirectAdminHtml() {
     $('copyBaseBtn').addEventListener('click', copyBaseUrl);
     $('copyBaseInlineBtn').addEventListener('click', copyBaseUrl);
     $('copyBaseHeroBtn').addEventListener('click', copyBaseUrl);
+    $('copyApiKeyBtn').addEventListener('click', copyApiKey);
     $('importTabSingle').addEventListener('click', () => setImportMode('single'));
     $('importTabBatch').addEventListener('click', () => setImportMode('batch'));
     $('importBtn').addEventListener('click', importAccounts);

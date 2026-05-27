@@ -5,14 +5,19 @@ import { readFileSync } from "node:fs";
 import {
   applyDirectCompletionEvents,
   buildDirectAdminHtml,
+  buildDirectAdminClientConfig,
   buildDirectAdminStatusPayload,
+  buildPromptFromClaudeMessages,
   createAssistantTextAccumulator,
+  createClaudeMessage,
+  createClaudeStreamEvent,
   createConnectFrameParser,
   createCursorClientResponsesForEvents,
   createDirectMetadataCaches,
   createLegacyDirectAccount,
   extractStringsFromProtobuf,
   getMetadataCache,
+  getPublicBaseUrl,
   importDirectAccounts,
   invalidateDirectMetadataCaches,
   isDirectAdminAuthorized,
@@ -99,6 +104,53 @@ test("normalizeDirectModel maps public auto alias to Cursor default model id", (
   assert.equal(normalizeDirectModel("auto"), "default");
   assert.equal(normalizeDirectModel("cursor/auto"), "default");
   assert.equal(normalizeDirectModel("cursor-acp/composer-2-fast"), "composer-2-fast");
+});
+
+test("normalizeDirectModel maps common Anthropic Claude aliases to Cursor direct model ids", () => {
+  assert.equal(normalizeDirectModel("claude-sonnet-4-5-20250929"), "sonnet-4.5");
+  assert.equal(normalizeDirectModel("claude-opus-4-6-20260115"), "opus-4.6");
+  assert.equal(normalizeDirectModel("claude-3-5-sonnet-20241022"), "default");
+});
+
+test("buildPromptFromClaudeMessages converts Claude system and text blocks", () => {
+  const prompt = buildPromptFromClaudeMessages([
+    { role: "user", content: [{ type: "text", text: "Hello" }] },
+    { role: "assistant", content: "Hi there." },
+    { role: "user", content: [{ type: "tool_result", content: [{ type: "text", text: "Tool says yes" }] }] },
+  ], [{ type: "text", text: "Be concise." }]);
+
+  assert.equal(
+    prompt,
+    [
+      "SYSTEM: Be concise.",
+      "USER: Hello",
+      "ASSISTANT: Hi there.",
+      "USER: Tool says yes",
+    ].join("\n\n"),
+  );
+});
+
+test("createClaudeMessage returns Anthropic message response shape", () => {
+  const response = createClaudeMessage("sonnet-4.5", "Hello from Cursor", "USER: Hello");
+
+  assert.equal(response.type, "message");
+  assert.equal(response.role, "assistant");
+  assert.equal(response.model, "sonnet-4.5");
+  assert.deepEqual(response.content, [{ type: "text", text: "Hello from Cursor" }]);
+  assert.equal(response.stop_reason, "end_turn");
+  assert.equal(typeof response.usage.input_tokens, "number");
+  assert.equal(typeof response.usage.output_tokens, "number");
+});
+
+test("createClaudeStreamEvent emits Anthropic SSE event frames", () => {
+  assert.equal(
+    createClaudeStreamEvent("content_block_delta", {
+      type: "content_block_delta",
+      index: 0,
+      delta: { type: "text_delta", text: "hi" },
+    }),
+    'event: content_block_delta\ndata: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"hi"}}\n\n',
+  );
 });
 
 test("extractStringsFromProtobuf recursively extracts nested printable strings", () => {
@@ -425,21 +477,70 @@ test("buildDirectAdminHtml uses the direct admin API prefix and NewAPI base path
   assert.match(page, /Cursor Direct/);
   assert.match(page, /\/direct-admin\/api/);
   assert.match(page, /\/v1/);
+  assert.match(page, /baseUrl \+ '\/messages'/);
   assert.match(page, /\/accounts\/import/);
   assert.match(page, /\/oauth\/start/);
+  assert.match(page, /client-config/);
+  assert.match(page, /apiKeyPreview/);
+  assert.match(page, /copyApiKeyBtn/);
+  assert.match(page, /execCommand\('copy'\)/);
   assert.match(page, /账号池/);
   assert.doesNotMatch(page, /cursor_gateway_admin_password/);
 });
 
 test("buildDirectAdminStatusPayload includes direct runtime fields for the admin dashboard", () => {
-  const payload = buildDirectAdminStatusPayload();
+  const payload = buildDirectAdminStatusPayload({
+    apiKey: "sk-cursor-direct-secret",
+    publicBaseUrl: "https://proxy.example/v1",
+  });
 
   assert.equal(payload.mode, "cursor-direct");
   assert.equal(payload.adminPath, "/direct-admin/");
   assert.equal(payload.apiBasePath, "/v1");
+  assert.equal(payload.publicBaseUrl, "https://proxy.example/v1");
+  assert.equal(payload.apiKeyConfigured, true);
+  assert.match(payload.apiKeyPreview, /^sk-cur.+secret$/);
+  assert.equal(payload.apiKey, undefined);
   assert.equal(typeof payload.memory.rss, "number");
   assert.equal(typeof payload.stats.averageDurationMs, "number");
   assert.equal(typeof payload.authRequired, "boolean");
+});
+
+test("buildDirectAdminClientConfig returns full API key only for the authenticated copy endpoint", () => {
+  const payload = buildDirectAdminClientConfig({
+    apiKey: "sk-cursor-direct-secret",
+    publicBaseUrl: "https://proxy.example/v1",
+  });
+
+  assert.equal(payload.ok, true);
+  assert.equal(payload.baseUrl, "https://proxy.example/v1");
+  assert.equal(payload.apiKey, "sk-cursor-direct-secret");
+  assert.match(payload.apiKeyPreview, /^sk-cur.+secret$/);
+});
+
+test("getPublicBaseUrl honors forwarded proxy headers for copied Base URL", () => {
+  const req = {
+    headers: {
+      host: "127.0.0.1:32126",
+      "x-forwarded-proto": "https",
+      "x-forwarded-host": "gw.example.com",
+    },
+  };
+
+  assert.equal(getPublicBaseUrl(req), "https://gw.example.com/v1");
+});
+
+test("getPublicBaseUrl preserves forwarded non-default public ports", () => {
+  const req = {
+    headers: {
+      host: "43.136.59.106",
+      "x-forwarded-proto": "http",
+      "x-forwarded-host": "43.136.59.106",
+      "x-forwarded-port": "32124",
+    },
+  };
+
+  assert.equal(getPublicBaseUrl(req), "http://43.136.59.106:32124/v1");
 });
 
 test("importDirectAccounts imports multiple accounts and summaries never expose full tokens", () => {
