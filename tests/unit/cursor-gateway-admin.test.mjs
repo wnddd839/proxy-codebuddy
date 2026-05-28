@@ -91,11 +91,85 @@ test("direct admin copies Base URL from page state instead of a transient input 
   assert.doesNotMatch(html, /baseUrlInput'\)\.value \|\|/);
 });
 
-test("direct admin renders the visible operations hero strip", () => {
+test("direct admin renders the dashboard header and runtime chips", () => {
   const html = buildDirectAdminHtml();
 
-  assert.match(html, /class="hero-strip"/);
-  assert.match(html, /NewAPI \/ OpenAI/);
-  assert.match(html, /Claude Code/);
+  assert.match(html, /class="dashboard-header"/);
+  assert.match(html, /id="runtimeChips"/);
+  assert.match(html, /CURSOR DIRECT GATEWAY/);
   assert.match(html, /OAuth/);
+});
+
+test("direct admin topbar exists with sticky positioning in CSS", () => {
+  const html = buildDirectAdminHtml();
+
+  // topbar element present
+  assert.match(html, /class="topbar/);
+  // sticky position defined in shared styles
+  assert.match(html, /position:\s*sticky/);
+});
+
+test("direct admin renders metric-grid with metric cards", () => {
+  const html = buildDirectAdminHtml();
+
+  assert.match(html, /class="metric-grid"/);
+  assert.match(html, /class="metric"/);
+  assert.match(html, /id="metricTotal"/);
+  assert.match(html, /id="metricEnabled"/);
+  assert.match(html, /id="metricDisabled"/);
+  assert.match(html, /id="metricLatency"/);
+  assert.match(html, /id="metricRequests"/);
+  assert.match(html, /id="metricBaseUrl"/);
+});
+
+test("direct admin has masked API key control (non-regression)", () => {
+  const html = buildDirectAdminHtml();
+
+  assert.match(html, /id="apiKeyDisplay"/);
+  assert.match(html, /type="password"/);
+  assert.match(html, /id="copyApiKeyBtn"/);
+  assert.doesNotMatch(html, /id="apiKeyPreview"/);
+});
+
+test("direct admin defines resolveBaseUrl and state.clientBaseUrl", () => {
+  const html = buildDirectAdminHtml();
+
+  assert.match(html, /function resolveBaseUrl/);
+  assert.match(html, /clientBaseUrl:/);
+  assert.match(html, /state\.clientBaseUrl/);
+});
+
+test("direct admin renders import tabs with three modes (single, batch, oauth)", () => {
+  const html = buildDirectAdminHtml();
+
+  // tab structure
+  assert.match(html, /class="import-tabs"/);
+  assert.match(html, /id="importTabs"/);
+  // three tab buttons
+  assert.match(html, /data-tab="single"/);
+  assert.match(html, /data-tab="batch"/);
+  assert.match(html, /data-tab="oauth"/);
+  // three tab panes
+  assert.match(html, /id="importPaneSingle"/);
+  assert.match(html, /id="importPaneBatch"/);
+  assert.match(html, /id="importPaneOAuth"/);
+});
+
+test("direct admin renders probe result area", () => {
+  const html = buildDirectAdminHtml();
+
+  assert.match(html, /class="probe-result"/);
+  assert.match(html, /id="probeBox"/);
+  assert.match(html, /id="probeModel"/);
+  assert.match(html, /id="probeBtn"/);
+});
+
+test("direct admin renders advanced debug details panel", () => {
+  const html = buildDirectAdminHtml();
+
+  assert.match(html, /<details class="advanced-panel"/);
+  assert.match(html, /<summary>高级调试信息<\/summary>/);
+  assert.match(html, /id="debugStatus"/);
+  assert.match(html, /id="debugAccounts"/);
+  assert.match(html, /id="debugOAuth"/);
 });
