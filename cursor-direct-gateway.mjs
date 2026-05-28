@@ -1009,30 +1009,15 @@ async function getCodeBuddyOAuthSessionPayload(options = {}) {
     authStatus = await fetchCodeBuddyAuthStatus();
     session.authStatus = authStatus;
     if (authStatus.authenticated) {
-      const imported = importCodeBuddyDaemonAccount(authStatus, {
-        label: codeBuddyOAuthSession.label || "CodeBuddy OAuth",
-      });
-      session.status = "complete";
-      session.completedAt = session.completedAt || Date.now();
+      session.status = session.status === "complete" ? "complete" : "ready";
       session.error = "";
       session.login = session.login || { success: true, message: "已检测到 CodeBuddy 登录态" };
       codeBuddyOAuthSession = { ...codeBuddyOAuthSession, ...session };
-      const payload = {
-        ok: true,
-        provider: "codebuddy",
-        session: {
-          ...session,
-          running: false,
-          authenticated: true,
-        },
-        accounts: imported.accounts,
-        account: imported.account,
-      };
-      return setMetadataCache(metadataCaches.codeBuddyOAuthSession, payload, { now, ttlMs: config.oauthSessionCacheTtlMs });
     }
   } catch (error) {
     session.error = error instanceof Error ? error.message : String(error);
   }
+  const accounts = summarizeCodeBuddyStore(readCodeBuddyStore());
   const payload = {
     ok: true,
     provider: "codebuddy",
@@ -1041,15 +1026,15 @@ async function getCodeBuddyOAuthSessionPayload(options = {}) {
       running: false,
       authenticated: Boolean(authStatus?.authenticated),
     },
-    accounts: summarizeCodeBuddyStore(readCodeBuddyStore()),
-    account: summarizeCodeBuddyStore(readCodeBuddyStore()).primary,
+    accounts,
+    account: accounts.primary,
   };
   return setMetadataCache(metadataCaches.codeBuddyOAuthSession, payload, { now, ttlMs: config.oauthSessionCacheTtlMs });
 }
 
 async function startCodeBuddyOAuthSession(options = {}) {
   if (codeBuddyOAuthSession.status === "starting" || codeBuddyOAuthSession.status === "waiting") {
-    return getCodeBuddyOAuthSessionPayload({ fresh: true });
+    return waitForCodeBuddyOAuthCompletion("");
   }
   codeBuddyOAuthSession = createCodeBuddyOAuthSessionState();
   codeBuddyOAuthSession.id = `${Date.now()}-${Math.random().toString(16).slice(2)}`;
@@ -1066,7 +1051,7 @@ async function startCodeBuddyOAuthSession(options = {}) {
   codeBuddyOAuthSession.updatedAt = Date.now();
   codeBuddyOAuthSession.error = login.message || "";
   clearMetadataCache(metadataCaches.codeBuddyOAuthSession);
-  return getCodeBuddyOAuthSessionPayload({ fresh: true });
+  return waitForCodeBuddyOAuthCompletion("");
 }
 
 async function waitForCodeBuddyOAuthCompletion(callbackUrl = "") {
