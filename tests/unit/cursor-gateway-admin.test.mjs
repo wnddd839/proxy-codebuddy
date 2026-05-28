@@ -90,3 +90,12 @@ test("direct admin copies Base URL from page state instead of a transient input 
   assert.match(html, /state\.clientBaseUrl/);
   assert.doesNotMatch(html, /baseUrlInput'\)\.value \|\|/);
 });
+
+test("direct admin renders the visible operations hero strip", () => {
+  const html = buildDirectAdminHtml();
+
+  assert.match(html, /class="hero-strip"/);
+  assert.match(html, /NewAPI \/ OpenAI/);
+  assert.match(html, /Claude Code/);
+  assert.match(html, /OAuth/);
+});

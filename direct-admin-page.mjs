@@ -54,6 +54,11 @@ export function buildDirectAdminHtml() {
           <div class="hero-kicker">Direct Gateway · 账号池控制台</div>
           <div class="hero-title">号池总览与运维，一屏完成</div>
           <div class="hero-copy">多账号轮询直连 Cursor 上游，对外提供 OpenAI 兼容 <code>/v1</code> 接口。</div>
+          <div class="hero-strip">
+            <div class="hero-chip"><strong>/v1</strong> NewAPI / OpenAI 兼容入口</div>
+            <div class="hero-chip"><strong>/messages</strong> Claude Code 接入格式</div>
+            <div class="hero-chip"><strong>OAuth</strong> 授权、导入、探针同屏处理</div>
+          </div>
         </div>
         <div class="status-pills">
           <span class="pill good" id="healthPill">运行状态读取中</span>

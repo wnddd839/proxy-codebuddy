@@ -5,6 +5,7 @@ export function buildAdminSharedStyles() {
       --panel: rgba(16, 22, 31, 0.88);
       --panel-2: #121a25;
       --panel-3: #0e141d;
+      --panel-hot: rgba(22, 34, 48, 0.96);
       --line: rgba(139, 154, 177, 0.2);
       --line-strong: rgba(177, 190, 211, 0.34);
       --text: #eef4fb;
@@ -13,6 +14,7 @@ export function buildAdminSharedStyles() {
       --accent: #49e6ae;
       --accent-hover: #86f5c9;
       --accent-2: #7dd3fc;
+      --accent-3: #f8c96a;
       --accent-dim: rgba(73, 230, 174, 0.12);
       --accent-line: rgba(73, 230, 174, 0.42);
       --warn: #f8c96a;
@@ -21,6 +23,7 @@ export function buildAdminSharedStyles() {
       --bad-dim: rgba(255, 127, 140, 0.13);
       --ink: #06110d;
       --shadow: 0 20px 54px rgba(0, 0, 0, 0.34);
+      --shadow-hot: 0 28px 80px rgba(0, 0, 0, 0.48);
       --radius: 8px;
       --font-ui: "PingFang SC", "Microsoft YaHei UI", "Microsoft YaHei", "Segoe UI Variable", "Segoe UI", sans-serif;
       --font-mono: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
@@ -30,9 +33,9 @@ export function buildAdminSharedStyles() {
       margin: 0;
       min-height: 100%;
       background:
-        linear-gradient(135deg, rgba(73, 230, 174, 0.12) 0%, rgba(73, 230, 174, 0) 38%),
-        linear-gradient(225deg, rgba(125, 211, 252, 0.1) 0%, rgba(125, 211, 252, 0) 34%),
-        linear-gradient(180deg, #070a0f 0%, #0a0f16 46%, #070a0f 100%);
+        linear-gradient(135deg, rgba(73, 230, 174, 0.18) 0%, rgba(73, 230, 174, 0) 34%),
+        linear-gradient(225deg, rgba(248, 201, 106, 0.12) 0%, rgba(248, 201, 106, 0) 28%),
+        linear-gradient(180deg, #05070a 0%, #0b121c 42%, #070a0f 100%);
       background-attachment: fixed;
       color: var(--text);
       font: 14px/1.55 var(--font-ui);
@@ -48,6 +51,18 @@ export function buildAdminSharedStyles() {
         linear-gradient(90deg, rgba(255, 255, 255, 0.04) 1px, transparent 1px);
       background-size: 28px 28px;
       mask-image: linear-gradient(180deg, black, transparent 72%);
+    }
+    body::after {
+      content: "DIRECT";
+      position: fixed;
+      right: -42px;
+      top: 82px;
+      z-index: 0;
+      pointer-events: none;
+      color: rgba(238, 244, 251, 0.035);
+      font: 900 132px/1 var(--font-mono);
+      letter-spacing: 0;
+      writing-mode: vertical-rl;
     }
     button, input, textarea, select { font: inherit; }
     button {
@@ -124,6 +139,7 @@ export function buildAdminSharedStyles() {
       max-width: 1480px;
       margin: 0 auto;
       padding: 18px 22px 36px;
+      z-index: 1;
     }
     .topbar, .panel, .login, .metric {
       border: 1px solid var(--line);
@@ -142,6 +158,17 @@ export function buildAdminSharedStyles() {
       gap: 16px;
       padding: 14px 16px;
       overflow: hidden;
+      border-color: rgba(73, 230, 174, 0.36);
+      background:
+        linear-gradient(90deg, rgba(73, 230, 174, 0.14), transparent 34%),
+        rgba(8, 12, 18, 0.88);
+    }
+    .topbar::before {
+      content: "";
+      position: absolute;
+      inset: 0 auto 0 0;
+      width: 5px;
+      background: linear-gradient(180deg, var(--accent), var(--accent-2), var(--accent-3));
     }
     .topbar::after {
       content: "";
@@ -154,8 +181,8 @@ export function buildAdminSharedStyles() {
     }
     .brand { display: flex; align-items: center; gap: 12px; min-width: 0; }
     .mark {
-      width: 42px;
-      height: 42px;
+      width: 48px;
+      height: 48px;
       border-radius: 8px;
       background:
         linear-gradient(145deg, rgba(73, 230, 174, 0.95), rgba(125, 211, 252, 0.86)),
@@ -172,11 +199,42 @@ export function buildAdminSharedStyles() {
     .actions, .row { display: flex; gap: 8px; flex-wrap: wrap; align-items: center; }
     .hero-panel {
       margin-top: 22px;
-      padding: 8px 2px 0;
+      position: relative;
+      padding: 24px;
       display: grid;
       gap: 18px;
+      overflow: hidden;
+      border: 1px solid rgba(73, 230, 174, 0.32);
+      border-radius: 10px;
+      background:
+        linear-gradient(135deg, rgba(73, 230, 174, 0.18), rgba(125, 211, 252, 0.08) 42%, rgba(248, 201, 106, 0.08)),
+        linear-gradient(180deg, rgba(19, 30, 43, 0.92), rgba(10, 15, 22, 0.94));
+      box-shadow: var(--shadow-hot);
+      backdrop-filter: blur(16px);
+    }
+    .hero-panel::before {
+      content: "";
+      position: absolute;
+      inset: 0;
+      pointer-events: none;
+      opacity: 0.2;
+      background:
+        repeating-linear-gradient(135deg, rgba(255,255,255,0.12) 0 1px, transparent 1px 12px);
+      mask-image: linear-gradient(90deg, transparent, black 20%, transparent 72%);
+    }
+    .hero-panel::after {
+      content: "POOL CONTROL";
+      position: absolute;
+      right: 22px;
+      bottom: 12px;
+      color: rgba(238, 244, 251, 0.05);
+      font: 900 42px/1 var(--font-mono);
+      letter-spacing: 0.02em;
+      pointer-events: none;
     }
     .hero-head {
+      position: relative;
+      z-index: 1;
       display: flex;
       justify-content: space-between;
       gap: 24px;
@@ -193,14 +251,42 @@ export function buildAdminSharedStyles() {
     .hero-title {
       margin-top: 7px;
       max-width: 980px;
-      font-size: clamp(24px, 3vw, 38px);
-      font-weight: 780;
+      font-size: clamp(30px, 4.2vw, 58px);
+      font-weight: 860;
       line-height: 1.08;
       letter-spacing: 0;
+      text-wrap: balance;
     }
-    .hero-copy { margin-top: 10px; max-width: 820px; color: var(--muted); font-size: 14px; }
+    .hero-copy { margin-top: 12px; max-width: 860px; color: var(--muted); font-size: 15px; }
+    .hero-strip {
+      display: grid;
+      grid-template-columns: repeat(3, minmax(0, 1fr));
+      gap: 10px;
+      margin-top: 18px;
+      max-width: 880px;
+    }
+    .hero-chip {
+      border: 1px solid rgba(177, 190, 211, 0.22);
+      border-radius: 8px;
+      padding: 10px 12px;
+      background: rgba(5, 9, 14, 0.45);
+      color: var(--muted);
+      font-size: 12px;
+    }
+    .hero-chip strong {
+      display: block;
+      margin-bottom: 4px;
+      color: var(--text);
+      font: 800 12px/1.1 var(--font-mono);
+    }
     .hero-actions { display: flex; gap: 8px; flex-wrap: wrap; justify-content: flex-end; }
-    .status-pills { display: flex; gap: 8px; flex-wrap: wrap; }
+    .status-pills {
+      display: flex;
+      gap: 8px;
+      flex-wrap: wrap;
+      justify-content: flex-end;
+      max-width: 420px;
+    }
     .pill {
       display: inline-flex;
       align-items: center;
@@ -224,8 +310,8 @@ export function buildAdminSharedStyles() {
     }
     .metric {
       position: relative;
-      padding: 15px 16px;
-      min-height: 100px;
+      padding: 17px 16px 16px;
+      min-height: 112px;
       display: flex;
       flex-direction: column;
       overflow: hidden;
@@ -237,8 +323,9 @@ export function buildAdminSharedStyles() {
       position: absolute;
       inset: 0 0 auto;
       height: 2px;
-      background: linear-gradient(90deg, var(--accent), var(--accent-2));
-      opacity: 0.55;
+      height: 4px;
+      background: linear-gradient(90deg, var(--accent), var(--accent-2), var(--accent-3));
+      opacity: 0.82;
     }
     .metric:hover {
       border-color: var(--line-strong);
@@ -254,7 +341,7 @@ export function buildAdminSharedStyles() {
     }
     .metric .value {
       margin-top: 9px;
-      font: 760 22px/1.15 var(--font-mono);
+      font: 820 26px/1.12 var(--font-mono);
       overflow: hidden;
       text-overflow: ellipsis;
       white-space: nowrap;
@@ -270,19 +357,43 @@ export function buildAdminSharedStyles() {
     .metric .hint { margin-top: auto; padding-top: 8px; color: var(--faint); font-size: 12px; }
     .content { display: grid; gap: 16px; margin-top: 18px; }
     .panel {
-      padding: 18px 20px;
+      position: relative;
+      padding: 20px 22px;
       transition: border-color 0.18s, background 0.18s, transform 0.18s;
       will-change: transform;
+      overflow: hidden;
+      border-color: rgba(177, 190, 211, 0.24);
+    }
+    .panel::before {
+      content: "";
+      position: absolute;
+      left: 0;
+      top: 0;
+      bottom: 0;
+      width: 3px;
+      background: linear-gradient(180deg, var(--accent), transparent);
+      opacity: 0.8;
     }
     .panel:hover {
       border-color: rgba(177, 190, 211, 0.28);
       background: rgba(17, 24, 35, 0.92);
     }
     .panel h2 {
+      display: flex;
+      align-items: center;
+      gap: 8px;
       margin: 0 0 14px;
-      font-size: 15px;
-      font-weight: 700;
-      letter-spacing: -0.01em;
+      font-size: 16px;
+      font-weight: 820;
+      letter-spacing: 0;
+    }
+    .panel h2::before {
+      content: "";
+      width: 9px;
+      height: 9px;
+      border-radius: 999px;
+      background: var(--accent);
+      box-shadow: 0 0 18px rgba(73, 230, 174, 0.55);
     }
     .ops-grid {
       display: grid;
@@ -295,12 +406,13 @@ export function buildAdminSharedStyles() {
       overflow-x: auto;
       border: 1px solid var(--line);
       border-radius: 8px;
-      background: rgba(7, 11, 16, 0.5);
+      background: rgba(7, 11, 16, 0.62);
+      box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.03);
     }
     .table { width: 100%; border-collapse: collapse; min-width: 520px; }
     .table th, .table td {
       text-align: left;
-      padding: 10px 12px;
+      padding: 11px 12px;
       border-bottom: 1px solid var(--line);
       vertical-align: top;
     }
@@ -309,13 +421,13 @@ export function buildAdminSharedStyles() {
       font-size: 11px;
       text-transform: uppercase;
       letter-spacing: 0.08em;
-      background: rgba(11, 16, 23, 0.92);
+      background: rgba(6, 10, 15, 0.98);
       position: sticky;
       top: 0;
       z-index: 1;
     }
     .table tr:last-child td { border-bottom: none; }
-    .table tbody tr:hover td { background: rgba(125, 211, 252, 0.035); }
+    .table tbody tr:hover td { background: rgba(73, 230, 174, 0.055); }
     .mono, .mono-box {
       border: 1px solid var(--line);
       border-radius: 8px;
@@ -380,7 +492,9 @@ export function buildAdminSharedStyles() {
       padding: 10px 12px;
       border: 1px solid var(--line);
       border-radius: 8px;
-      background: rgba(8, 12, 18, 0.86);
+      background:
+        linear-gradient(90deg, rgba(73, 230, 174, 0.08), transparent 24%),
+        rgba(8, 12, 18, 0.86);
       transition: border-color 0.18s, transform 0.18s, background 0.18s;
     }
     .endpoint-row:hover {
@@ -390,7 +504,7 @@ export function buildAdminSharedStyles() {
     }
     .endpoint-method {
       font: 700 11px/1 var(--font-mono);
-      color: var(--accent);
+      color: var(--accent-3);
       letter-spacing: 0.06em;
     }
     .endpoint-path {
@@ -415,7 +529,14 @@ export function buildAdminSharedStyles() {
     }
     .step strong { display: block; color: var(--text); margin-bottom: 4px; font-size: 13px; }
     .login-wrap { min-height: 100vh; display: grid; place-items: center; padding: 22px; }
-    .login { width: min(520px, 100%); padding: 24px; }
+    .login {
+      width: min(560px, 100%);
+      padding: 28px;
+      border-color: rgba(73, 230, 174, 0.34);
+      background:
+        linear-gradient(135deg, rgba(73, 230, 174, 0.12), transparent 38%),
+        var(--panel);
+    }
     .login h1 { margin: 0; font-size: 26px; font-weight: 750; letter-spacing: -0.02em; }
     .login p { color: var(--muted); margin: 12px 0 20px; }
     .field { display: grid; gap: 8px; }
@@ -494,8 +615,8 @@ export function buildAdminSharedStyles() {
     .metric-grid.six {
       grid-template-columns: repeat(6, minmax(0, 1fr));
     }
-    .metric-grid.six .metric { min-height: 88px; }
-    .metric-grid.six .metric .value { font-size: 20px; }
+    .metric-grid.six .metric { min-height: 112px; }
+    .metric-grid.six .metric .value { font-size: 25px; }
     .badge {
       display: inline-flex;
       align-items: center;
@@ -564,6 +685,7 @@ export function buildAdminSharedStyles() {
       .metric-grid.six { grid-template-columns: repeat(3, minmax(0, 1fr)); }
       .metric-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
       .ops-grid, .split, .latency-steps { grid-template-columns: 1fr; }
+      .hero-strip { grid-template-columns: 1fr; }
     }
     @media (max-width: 640px) {
       .shell { padding: 12px 14px 24px; }
@@ -574,7 +696,9 @@ export function buildAdminSharedStyles() {
       .copyline { display: grid; }
       .kv-row { grid-template-columns: 1fr; gap: 4px; }
       .endpoint-row { grid-template-columns: 1fr; gap: 6px; }
-      .hero-title { font-size: 19px; }
+      .hero-panel { padding: 18px; }
+      .hero-title { font-size: 27px; }
+      .status-pills { justify-content: flex-start; }
     }
   `;
 }
