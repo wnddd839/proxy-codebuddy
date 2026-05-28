@@ -21,6 +21,7 @@ import {
   createDirectMetadataCaches,
   createLegacyDirectAccount,
   extractStringsFromProtobuf,
+  findCursorNativeToolUse,
   getMetadataCache,
   getPublicBaseUrl,
   importDirectAccounts,
@@ -234,6 +235,90 @@ test("createClaudeMessagesResponse turns strict tool JSON into a Claude tool_use
   assert.equal(response.content[0].type, "tool_use");
   assert.equal(response.content[0].name, "Read");
   assert.deepEqual(response.content[0].input, { file_path: "README.md" });
+});
+
+test("findCursorNativeToolUse maps Cursor read events to Claude Read", () => {
+  const toolUse = findCursorNativeToolUse([{
+    type: "exec_read_rejected",
+    path: "/workspace/README.md",
+  }], {
+    tools: [{ name: "Read" }],
+    toolChoice: { type: "auto" },
+  });
+
+  assert.equal(toolUse.name, "Read");
+  assert.match(toolUse.id, /^toolu_/);
+  assert.deepEqual(toolUse.input, { file_path: "/workspace/README.md" });
+  assert.equal(toolUse.source, "cursor_native");
+});
+
+test("findCursorNativeToolUse maps Cursor shell events to Claude Bash", () => {
+  const toolUse = findCursorNativeToolUse([{
+    type: "exec_shell_rejected",
+    command: "npm test",
+    workingDirectory: "/workspace/app",
+  }], {
+    tools: [{ name: "Bash" }],
+    toolChoice: { type: "auto" },
+  });
+
+  assert.equal(toolUse.name, "Bash");
+  assert.deepEqual(toolUse.input, {
+    command: "npm test",
+    working_directory: "/workspace/app",
+  });
+});
+
+test("findCursorNativeToolUse respects Claude tools and tool_choice", () => {
+  assert.equal(findCursorNativeToolUse([{
+    type: "exec_read_rejected",
+    path: "/workspace/README.md",
+  }], {
+    tools: [{ name: "Bash" }],
+    toolChoice: { type: "auto" },
+  }), null);
+
+  assert.equal(findCursorNativeToolUse([{
+    type: "exec_shell_rejected",
+    command: "npm test",
+  }], {
+    tools: [{ name: "Bash" }],
+    toolChoice: { type: "none" },
+  }), null);
+
+  assert.equal(findCursorNativeToolUse([{
+    type: "exec_shell_rejected",
+    command: "npm test",
+  }], {
+    tools: [{ name: "Bash" }, { name: "Read" }],
+    toolChoice: { type: "tool", name: "Read" },
+  }), null);
+});
+
+test("createClaudeMessagesResponse prefers native Cursor tool use over text fallback", () => {
+  const response = createClaudeMessagesResponse(
+    "composer-2.5-fast",
+    "I should read README.md first.",
+    "USER: Read README.md",
+    {
+      publicModel: "claude-sonnet-4-5",
+      nativeToolUse: {
+        id: "toolu_native",
+        name: "Read",
+        input: { file_path: "README.md" },
+        source: "cursor_native",
+      },
+      tools: [{ name: "Read" }],
+    },
+  );
+
+  assert.equal(response.stop_reason, "tool_use");
+  assert.deepEqual(response.content[0], {
+    type: "tool_use",
+    id: "toolu_native",
+    name: "Read",
+    input: { file_path: "README.md" },
+  });
 });
 
 test("createClaudeMessageStartPayload starts only the message envelope", () => {
@@ -560,6 +645,42 @@ test("runDirectCompletionWithRetry retries another account before first payload"
   assert.deepEqual(selected, ["first", "second"]);
   assert.equal(result.text, "ok");
   assert.equal(result.accountId, "second");
+});
+
+test("runDirectCompletionWithRetry preserves native tool use results", async () => {
+  const result = await runDirectCompletionWithRetry("hello", "default", {
+    maxAttempts: 1,
+    tools: [{ name: "Read" }],
+    toolChoice: { type: "auto" },
+    captureNativeToolUse: true,
+    selectAccount: async () => ({
+      source: "pool",
+      account: { id: "first", accessToken: "token-1" },
+      store: { accounts: [] },
+      index: 0,
+    }),
+    runAttempt: async (_prompt, _model, options) => {
+      assert.equal(options.captureNativeToolUse, true);
+      assert.equal(options.tools[0].name, "Read");
+      return {
+        text: "",
+        toolUse: {
+          id: "toolu_native",
+          name: "Read",
+          input: { file_path: "README.md" },
+          source: "cursor_native",
+        },
+        durationMs: 10,
+        bytes: 2,
+        stringCount: 0,
+        deltaCount: 0,
+      };
+    },
+    markResult: () => {},
+  });
+
+  assert.equal(result.toolUse.name, "Read");
+  assert.equal(result.accountId, "first");
 });
 
 function fakeJwt(payload) {

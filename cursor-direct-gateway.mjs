@@ -2315,6 +2315,72 @@ function normalizeToolUseInput(value) {
   return {};
 }
 
+function pickToolNameByAliases(tools, aliases) {
+  const requestedTools = normalizeClaudeTools(tools);
+  const aliasSet = new Set(
+    (Array.isArray(aliases) ? aliases : [])
+      .map((alias) => String(alias || "").trim().toLowerCase())
+      .filter(Boolean),
+  );
+  for (const tool of requestedTools) {
+    if (aliasSet.has(tool.name.toLowerCase())) return tool.name;
+  }
+  return "";
+}
+
+function buildCursorNativeToolInput(event, toolName) {
+  const canonical = String(toolName || "").trim().toLowerCase();
+  if (canonical === "read") return { file_path: event.path || "" };
+  if (canonical === "ls" || canonical === "list") return { path: event.path || "" };
+  if (canonical === "bash" || canonical === "shell") {
+    const input = { command: event.command || "" };
+    if (event.workingDirectory) input.working_directory = event.workingDirectory;
+    return input;
+  }
+  if (canonical === "fetch" || canonical === "webfetch") return { url: event.url || "" };
+  return {};
+}
+
+function buildCursorNativeToolUse(event, options = {}) {
+  if (!event || typeof event !== "object") return null;
+  const choice = normalizeClaudeToolChoice(options.toolChoice);
+  if (choice?.type === "none") return null;
+
+  let toolName = "";
+  if (event.type === "exec_read_rejected") {
+    toolName = pickToolNameByAliases(options.tools, ["Read", "read", "read_file", "ReadFile"]);
+  } else if (event.type === "exec_ls_rejected") {
+    toolName = pickToolNameByAliases(options.tools, ["LS", "List", "ls", "list"]);
+  } else if (
+    event.type === "exec_shell_rejected" ||
+    event.type === "exec_shell_stream_rejected" ||
+    event.type === "exec_background_shell_rejected"
+  ) {
+    toolName = pickToolNameByAliases(options.tools, ["Bash", "Shell", "bash", "shell"]);
+  } else if (event.type === "exec_fetch_error") {
+    toolName = pickToolNameByAliases(options.tools, ["Fetch", "WebFetch", "fetch", "webfetch"]);
+  }
+
+  if (!toolName) return null;
+  if (choice?.type === "tool" && toolName !== choice.name) return null;
+
+  return {
+    id: `toolu_${randomUUID().replace(/-/g, "")}`,
+    name: toolName,
+    input: buildCursorNativeToolInput(event, toolName),
+    source: "cursor_native",
+    eventType: event.type,
+  };
+}
+
+function findCursorNativeToolUse(events = [], options = {}) {
+  for (const event of Array.isArray(events) ? events : []) {
+    const toolUse = buildCursorNativeToolUse(event, options);
+    if (toolUse) return toolUse;
+  }
+  return null;
+}
+
 function parseClaudeToolUse(text, options = {}) {
   const root = extractFirstJsonObject(text);
   if (!root) return null;
@@ -2475,6 +2541,19 @@ function runDirectCompletion(prompt, model, options = {}) {
         settle(reject, makeError(error instanceof Error ? error.message : String(error)));
         return;
       }
+      const nativeToolUse = options.captureNativeToolUse ? findCursorNativeToolUse(events, options) : null;
+      if (nativeToolUse) {
+        settle(resolve, {
+          text: accumulator.text,
+          toolUse: nativeToolUse,
+          status,
+          durationMs: Date.now() - started,
+          bytes: responseBytes,
+          stringCount,
+          deltaCount,
+        });
+        return;
+      }
       writeCursorClientResponses(events, request, cursorClientState);
       handleCompletionEvents(events);
       if (settled) return;
@@ -2515,6 +2594,9 @@ async function runDirectCompletionWithRetry(prompt, model, options = {}) {
         account: selection.account,
         idleMs: options.idleMs,
         signal: options.signal,
+        tools: options.tools,
+        toolChoice: options.toolChoice,
+        captureNativeToolUse: options.captureNativeToolUse,
         onDelta: (delta, meta) => {
           emittedOnAttempt = emittedOnAttempt || Boolean(delta);
           options.onDelta?.(delta, meta);
@@ -2661,7 +2743,8 @@ function shouldAttemptClaudeToolUse(options = {}) {
 }
 
 function createClaudeMessagesResponse(model, content, prompt, options = {}) {
-  const toolUse = shouldAttemptClaudeToolUse(options) ? parseClaudeToolUse(content, options) : null;
+  const toolUse = options.nativeToolUse
+    || (shouldAttemptClaudeToolUse(options) ? parseClaudeToolUse(content, options) : null);
   if (toolUse) {
     return createClaudeToolUseMessage(model, toolUse, prompt, {
       id: options.id,
@@ -3432,6 +3515,9 @@ async function handle(req, res) {
         else startTextBlock();
         const result = await runDirectCompletionFromPool(prompt, model, {
           signal: controller.signal,
+          tools: body?.tools,
+          toolChoice: body?.tool_choice,
+          captureNativeToolUse: shouldBufferToolResponse,
           onDelta: (delta) => {
             if (!delta || res.destroyed) return;
             if (shouldBufferToolResponse) return;
@@ -3446,7 +3532,9 @@ async function handle(req, res) {
           },
         });
         if (keepAliveTimer) clearInterval(keepAliveTimer);
-        const toolUse = shouldBufferToolResponse ? parseClaudeToolUse(result.text, claudeToolOptions) : null;
+        const toolUse = shouldBufferToolResponse
+          ? (result.toolUse || parseClaudeToolUse(result.text, claudeToolOptions))
+          : null;
         finishRequest(true, {
           outputChars: result.text.length,
           upstreamBytes: result.bytes,
@@ -3489,7 +3577,11 @@ async function handle(req, res) {
     }
 
     try {
-      const result = await runDirectCompletionFromPool(prompt, model);
+      const result = await runDirectCompletionFromPool(prompt, model, {
+        tools: body?.tools,
+        toolChoice: body?.tool_choice,
+        captureNativeToolUse: shouldBufferToolResponse,
+      });
       finishRequest(true, {
         outputChars: result.text.length,
         upstreamBytes: result.bytes,
@@ -3510,6 +3602,7 @@ async function handle(req, res) {
 
       const response = json(200, createClaudeMessagesResponse(model, result.text, prompt, {
         publicModel: requestedModel,
+        nativeToolUse: result.toolUse,
         tools: body?.tools,
         toolChoice: body?.tool_choice,
       }));
@@ -3703,6 +3796,7 @@ export {
   createCursorClientResponsesForEvents,
   createDirectMetadataCaches,
   extractStringsFromProtobuf,
+  findCursorNativeToolUse,
   generateChecksum,
   getMetadataCache,
   getPublicBaseUrl,
