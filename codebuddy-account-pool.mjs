@@ -1,4 +1,3 @@
-import { spawn } from "node:child_process";
 import { createHash } from "node:crypto";
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
@@ -7,8 +6,10 @@ import path from "node:path";
 import { createCodeBuddyHeaders, normalizeBaseUrl } from "./codebuddy-provider.mjs";
 
 const DEFAULT_CODEBUDDY_ACCOUNTS_PATH = path.join(homedir(), ".codebuddy", "proxy-accounts.json");
-const DEFAULT_HELPER_TIMEOUT_MS = 10000;
-const MAX_HELPER_OUTPUT_BYTES = 64 * 1024;
+const CODEBUDDY_SITE_CONFIG = {
+  domestic: { site: "domestic", baseUrl: "https://www.codebuddy.cn", internetEnvironment: "internal" },
+  global: { site: "global", baseUrl: "https://www.codebuddy.ai", internetEnvironment: "" },
+};
 
 function maskSecret(value, visible = 5) {
   const text = String(value || "");
@@ -30,6 +31,17 @@ function compactString(value) {
   return String(value || "").trim();
 }
 
+function looksLikeCodeBuddySecretValue(value) {
+  const text = compactString(value).replace(/^['"]|['"]$/g, "");
+  if (!text) return false;
+  if (/^\d{10,}$/.test(text)) return false;
+  if (/^[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}$/i.test(text)) return false;
+  if (text.length < 16) return false;
+  if (/^eyJ[A-Za-z0-9_-]*\./.test(text)) return true;
+  if (/[A-Za-z]/.test(text) && /[A-Za-z0-9]/.test(text)) return true;
+  return false;
+}
+
 function normalizeAuthStatus(value) {
   const source = value && typeof value === "object" ? value : {};
   const loggedIn = typeof source.loggedIn === "boolean"
@@ -49,36 +61,37 @@ function normalizeAuthStatus(value) {
 
 function normalizeCodeBuddyAccountAuth(input) {
   const source = input && typeof input === "object" ? input : {};
-  return {
-    authToken: compactString(source.authToken || source.auth_token || source.token || source.accessToken || ""),
-    apiKey: compactString(source.apiKey || source.api_key || source.key || ""),
-    apiKeyHelper: compactString(source.apiKeyHelper || source.api_key_helper || source.helper || ""),
-  };
+  return { apiKey: compactString(source.apiKey || source.api_key || source.xApiKey || source.x_api_key || source["x-api-key"] || source.key || "") };
 }
 
 function getCredentialHash(auth) {
-  return hashSecret(auth.authToken || auth.apiKey || auth.apiKeyHelper || "");
-}
-
-function isDaemonAuthType(value) {
-  return ["daemon", "daemon_oauth", "oauth", "codebuddy_daemon"].includes(compactString(value).toLowerCase());
+  return hashSecret(auth.apiKey || "");
 }
 
 function getAuthType(auth) {
-  if (auth.authToken) return "auth_token";
-  if (auth.apiKeyHelper) return "api_key_helper";
   if (auth.apiKey) return "api_key";
   return "";
 }
 
+function normalizeCodeBuddySite(value) {
+  const text = compactString(value).toLowerCase();
+  if (["domestic", "cn", "china", "internal"].includes(text)) return "domestic";
+  return "global";
+}
+
+function inferCodeBuddySite(source = {}) {
+  if (source.site || source.codeBuddySite || source.codebuddy_site) {
+    return normalizeCodeBuddySite(source.site || source.codeBuddySite || source.codebuddy_site);
+  }
+  const env = compactString(source.internetEnvironment || source.internet_environment || "").toLowerCase();
+  if (env === "internal") return "domestic";
+  const url = compactString(source.baseUrl || source.url || "").toLowerCase();
+  if (url.includes("codebuddy.cn") || url.includes("copilot.tencent.com")) return "domestic";
+  return "global";
+}
+
 function hasCodeBuddyCredentials(account) {
-  return Boolean(
-    account?.authToken ||
-    account?.apiKeyHelper ||
-    account?.apiKey ||
-    isDaemonAuthType(account?.authType) ||
-    account?.useDaemonAuth === true,
-  );
+  return Boolean(compactString(account?.apiKey || ""));
 }
 
 function getCodeBuddyAccountsPath(options = {}) {
@@ -122,17 +135,16 @@ export function createCodeBuddyAccount(raw = {}, options = {}) {
   const now = Number(options.now || Date.now());
   const auth = normalizeCodeBuddyAccountAuth(source);
   const authStatus = normalizeAuthStatus(source.authStatus || source.status || {});
-  const daemonAuth = source.useDaemonAuth === true ||
-    isDaemonAuthType(source.authType || source.auth_type || source.authMode || authStatus.authMode);
-  const baseUrl = normalizeBaseUrl(source.baseUrl || source.url || "");
-  const credentialHash = source.credentialHash || (daemonAuth
-    ? hashSecret(`daemon|${baseUrl}|${source.internetEnvironment || source.internet_environment || ""}`)
-    : getCredentialHash(auth));
+  const site = inferCodeBuddySite(source);
+  const siteConfig = CODEBUDDY_SITE_CONFIG[site] || CODEBUDDY_SITE_CONFIG.global;
+  const baseUrl = normalizeBaseUrl(source.baseUrl || source.url || siteConfig.baseUrl);
+  const internetEnvironment = compactString(source.internetEnvironment || source.internet_environment || siteConfig.internetEnvironment);
+  const credentialHash = source.credentialHash || getCredentialHash(auth);
   const identity = authStatus.userId || authStatus.userName || source.subject || source.email || source.label || "";
   const id = compactString(
     options.id ||
     source.id ||
-    hashSecret(`${identity}|${credentialHash}|${baseUrl}|${source.internetEnvironment || ""}`),
+    hashSecret(`${identity}|${credentialHash}|${baseUrl}|${internetEnvironment}|${site}`),
   );
   const createdAt = Number(source.createdAt || (options.preserveTimestamps ? now : 0) || now);
   const updatedAt = Number(source.updatedAt || now);
@@ -143,13 +155,12 @@ export function createCodeBuddyAccount(raw = {}, options = {}) {
     label: compactString(source.label || authStatus.userName || authStatus.userId || `CodeBuddy ${id.slice(0, 6)}`),
     enabled: source.enabled !== false && options.enabled !== false,
     source: compactString(options.source || source.source || "pool"),
+    site,
     baseUrl,
-    internetEnvironment: compactString(source.internetEnvironment || source.internet_environment || ""),
-    authType: daemonAuth ? "daemon" : getAuthType(auth),
-    useDaemonAuth: daemonAuth,
-    authToken: auth.authToken,
+    internetEnvironment,
+    authType: getAuthType(auth),
+    useDaemonAuth: false,
     apiKey: auth.apiKey,
-    apiKeyHelper: auth.apiKeyHelper,
     credentialHash,
     authStatus,
     createdAt,
@@ -184,6 +195,7 @@ export function summarizeCodeBuddyAccount(account) {
     label: account?.label || "",
     enabled: account?.enabled !== false,
     source: account?.source || "pool",
+    site: account?.site || inferCodeBuddySite(account || {}),
     baseUrl: account?.baseUrl || "",
     internetEnvironment: account?.internetEnvironment || "",
     authType,
@@ -193,9 +205,11 @@ export function summarizeCodeBuddyAccount(account) {
     userName: authStatus.userName,
     userNickname: authStatus.userNickname,
     authMode: authStatus.authMode,
-    authTokenPreview: maskSecret(account?.authToken, 6),
+    authTokenPreview: "",
+    refreshTokenPreview: "",
     apiKeyPreview: maskSecret(account?.apiKey, 6),
-    apiKeyHelperPreview: maskSecret(account?.apiKeyHelper, 6),
+    apiKeyHelperPreview: "",
+    cookiePreview: "",
     createdAt: Number(account?.createdAt || 0),
     updatedAt: Number(account?.updatedAt || 0),
     lastUsedAt: Number(account?.lastUsedAt || 0),
@@ -233,6 +247,7 @@ export function importCodeBuddyAccounts(store, input, options = {}) {
 
   for (const raw of parseCodeBuddyAccountsImportInput(input)) {
     const account = createCodeBuddyAccount(raw, { now });
+    if (!hasCodeBuddyCredentials(account)) continue;
     const existingIndex = nextStore.accounts.findIndex((item) => (
       item.id === account.id ||
       (account.credentialHash && item.credentialHash === account.credentialHash) ||
@@ -338,98 +353,17 @@ export function markCodeBuddyAccountResult(selection, ok, options = {}) {
   writeCodeBuddyAccountsStore({ ...store, accounts }, { accountsPath });
 }
 
-function runApiKeyHelper(command, options = {}) {
-  return new Promise((resolve, reject) => {
-    const timeoutMs = Math.max(1000, Number(options.timeoutMs || DEFAULT_HELPER_TIMEOUT_MS));
-    const child = spawn(command, {
-      shell: true,
-      stdio: ["ignore", "pipe", "pipe"],
-      env: { ...process.env, ...(options.env || {}) },
-      windowsHide: true,
-    });
-
-    let stdout = "";
-    let stderr = "";
-    const timer = setTimeout(() => {
-      try {
-        child.kill("SIGTERM");
-      } catch {
-        // ignore
-      }
-      reject(new Error("CodeBuddy apiKeyHelper timed out"));
-    }, timeoutMs);
-
-    child.stdout.on("data", (chunk) => {
-      stdout += Buffer.from(chunk).toString("utf8");
-      if (Buffer.byteLength(stdout, "utf8") > MAX_HELPER_OUTPUT_BYTES) {
-        try {
-          child.kill("SIGTERM");
-        } catch {
-          // ignore
-        }
-        reject(new Error("CodeBuddy apiKeyHelper output exceeded limit"));
-      }
-    });
-    child.stderr.on("data", (chunk) => {
-      stderr += Buffer.from(chunk).toString("utf8");
-    });
-    child.on("error", (error) => {
-      clearTimeout(timer);
-      reject(error);
-    });
-    child.on("close", (code) => {
-      clearTimeout(timer);
-      if (code !== 0) {
-        reject(new Error(`CodeBuddy apiKeyHelper exited with code ${String(code)}: ${stderr.trim().slice(0, 300)}`));
-        return;
-      }
-      resolve(stdout);
-    });
-  });
-}
-
-function firstNonEmptyLine(text) {
-  return String(text || "").split(/\r?\n/).map((line) => line.trim()).find(Boolean) || "";
-}
-
 export async function resolveCodeBuddyAccountHeaders(account, options = {}) {
   const normalized = createCodeBuddyAccount(account || {});
   const baseHeaders = createCodeBuddyHeaders({
-    exemptRequestHeader: options.exemptRequestHeader,
+    exemptRequestHeader: true,
   });
-
-  if (normalized.authToken) {
-    return {
-      ...baseHeaders,
-      authorization: `Bearer ${normalized.authToken}`,
-    };
-  }
-
-  if (normalized.apiKeyHelper) {
-    const helperRunner = options.helperRunner || runApiKeyHelper;
-    const value = firstNonEmptyLine(await helperRunner(normalized.apiKeyHelper, {
-      account: normalized,
-      timeoutMs: options.helperTimeoutMs,
-      env: options.env,
-    }));
-    if (!value) throw new Error("CodeBuddy apiKeyHelper returned empty credentials");
-    return {
-      ...baseHeaders,
-      "x-api-key": value,
-      authorization: `Bearer ${value}`,
-    };
-  }
 
   if (normalized.apiKey) {
     return {
       ...baseHeaders,
-      "x-api-key": normalized.apiKey,
-      authorization: `Bearer ${normalized.apiKey}`,
+      "X-Api-Key": normalized.apiKey,
     };
-  }
-
-  if (isDaemonAuthType(normalized.authType)) {
-    return baseHeaders;
   }
 
   throw new Error(`CodeBuddy account has no credentials: ${normalized.id}`);

@@ -182,7 +182,7 @@ test("direct admin renders advanced debug details panel", () => {
   assert.match(html, /id="debugOAuth"/);
 });
 
-test("direct admin renders the CodeBuddy management panel structure", () => {
+test("direct admin renders an api-key-only CodeBuddy import panel", () => {
   const html = buildDirectAdminHtml();
 
   assert.match(html, /id="codebuddyPanel"/);
@@ -193,72 +193,57 @@ test("direct admin renders the CodeBuddy management panel structure", () => {
   assert.match(html, /id="codebuddyAccountSummary"/);
   assert.match(html, /id="codebuddyAccountRows"/);
   assert.match(html, /id="codebuddyModelRows"/);
-  assert.match(html, /id="codebuddyOAuthPanel"/);
-  assert.match(html, /id="cbOauthStartBtn"/);
-  assert.match(html, /id="cbOauthCheckBtn"/);
-  assert.match(html, /id="cbOauthUrl"/);
-  assert.match(html, /id="cbOauthStatusBox"/);
-  assert.doesNotMatch(html, /id="codebuddyImportTabs"/);
-  assert.doesNotMatch(html, /id="cbImportAuthToken"/);
-  assert.doesNotMatch(html, /id="cbImportApiKey"/);
-  assert.doesNotMatch(html, /id="cbImportApiKeyHelper"/);
-  assert.doesNotMatch(html, /id="cbImportBatchJson"/);
+  assert.match(html, /id="codebuddyApiKeyPanel"/);
+  assert.match(html, /id="cbApiKeyLabel"/);
+  assert.match(html, /id="cbApiKeySite"/);
+  assert.match(html, /value="domestic"/);
+  assert.match(html, /value="global"/);
+  assert.match(html, /id="cbApiKeyValue"/);
+  assert.match(html, /id="cbApiKeyImportBtn"/);
   assert.match(html, /id="cbProbeBtn"/);
   assert.match(html, /id="cbProbeBox"/);
+  assert.doesNotMatch(html, /id="codebuddyOAuthPanel"/);
+  assert.doesNotMatch(html, /id="cbOauthStartBtn"/);
+  assert.doesNotMatch(html, /id="cbOauthCheckBtn"/);
+  assert.doesNotMatch(html, /id="cbOauthModal"/);
+  assert.doesNotMatch(html, /Copy as cURL/);
+  assert.doesNotMatch(html, /HttpOnly Cookie/);
+  assert.doesNotMatch(html, /Cookie Header/);
+  assert.doesNotMatch(html, /Refresh Token/);
+  assert.doesNotMatch(html, /Auth Token/);
+  assert.doesNotMatch(html, /apiKeyHelper/);
 });
 
-test("direct admin wires CodeBuddy state and refresh logic", () => {
+test("direct admin renders CodeBuddy account site in the account pool", () => {
   const html = buildDirectAdminHtml();
 
-  // state slot
-  assert.match(html, /codebuddy:\s*\{/);
-  assert.match(html, /importMode:\s*'single'/);
-  assert.match(html, /unsupported:\s*false/);
-  assert.match(html, /oauthPayload:\s*null/);
-  // core helpers exist
+  assert.match(html, /<th>站点<\/th>/);
+  assert.match(html, /function codeBuddySiteLabel/);
+  assert.match(html, /account\.site/);
+});
+
+test("direct admin wires api-key-only CodeBuddy import logic", () => {
+  const html = buildDirectAdminHtml();
+
   assert.match(html, /function refreshCodeBuddy/);
   assert.match(html, /function renderCodeBuddy\b/);
-  assert.match(html, /function renderCodeBuddyOAuth/);
-  assert.match(html, /function startCodeBuddyOAuth/);
-  assert.match(html, /function checkCodeBuddyOAuth/);
-  assert.match(html, /function codeBuddyAccountAction/);
+  assert.match(html, /function renderCodeBuddyApiKeyImport/);
+  assert.match(html, /function importCodeBuddyApiKey/);
+  assert.match(html, /\/codebuddy\/accounts\/import/);
+  assert.match(html, /cbApiKeySite/);
+  assert.match(html, /JSON\.stringify\(\{\s*label,\s*apiKey,\s*site\s*\}\)/);
+  assert.match(html, /refreshCodeBuddy\(true\)/);
   assert.match(html, /function runCodeBuddyProbe/);
   assert.match(html, /function loadCodeBuddyModels/);
-  // hits the documented backend routes
-  assert.match(html, /\/codebuddy\/status/);
-  assert.match(html, /\/codebuddy\/accounts/);
-  assert.match(html, /\/codebuddy\/oauth\/session/);
-  assert.match(html, /\/codebuddy\/oauth\/start/);
-  assert.match(html, /\/codebuddy\/oauth\/callback/);
-  assert.match(html, /\/codebuddy\/models/);
-  assert.match(html, /\/codebuddy\/probe/);
-  assert.doesNotMatch(html, /function buildCodeBuddyImportBody/);
-  // setActiveView hooks the codebuddy refresh, but normal Cursor refresh stays scoped
-  assert.match(html, /refreshCodeBuddy\(true\)/);
-  assert.doesNotMatch(html, /renderAll\(\);\s*try\s*\{\s*await refreshCodeBuddy\(true\);/);
-});
-
-test("direct admin does not show CodeBuddy daemon base URL as OAuth link", () => {
-  const html = buildDirectAdminHtml();
-
-  assert.match(html, /function renderCodeBuddyOAuth/);
-  assert.doesNotMatch(html, /state\.codebuddy\.status\?\.baseUrl/);
-  assert.doesNotMatch(html, /baseUrl:\s*payload\.session\.url/);
-});
-
-test("direct admin accepts gateway CodeBuddy OAuth launch links", () => {
-  const html = buildDirectAdminHtml();
-  const script = html.match(/<script>([\s\S]*)<\/script>/)?.[1] || "";
-  const source = script.match(/function normalizeCodeBuddyOAuthUrl\([^]*?^    \}/m)?.[0] || "";
-  assert.ok(source);
-
-  const normalize = new Function(`${source}; return normalizeCodeBuddyOAuthUrl;`)();
-
-  assert.equal(
-    normalize("/direct-admin/codebuddy/oauth/launch?id=session&token=secret"),
-    "/direct-admin/codebuddy/oauth/launch?id=session&token=secret",
-  );
-  assert.equal(normalize("http://127.0.0.1:8080"), "");
+  assert.doesNotMatch(html, /function renderCodeBuddyOAuth/);
+  assert.doesNotMatch(html, /function startCodeBuddyOAuth/);
+  assert.doesNotMatch(html, /function checkCodeBuddyOAuth/);
+  assert.doesNotMatch(html, /function buildCodeBuddyStorageCollectorScript/);
+  assert.doesNotMatch(html, /function buildCodeBuddyCookieCollectorScript/);
+  assert.doesNotMatch(html, /function buildCodeBuddyHelperTemplate/);
+  assert.doesNotMatch(html, /api\('\/codebuddy\/oauth\/session'/);
+  assert.doesNotMatch(html, /api\('\/codebuddy\/oauth\/start'/);
+  assert.doesNotMatch(html, /api\('\/codebuddy\/oauth\/callback'/);
 });
 
 test("direct admin handles missing CodeBuddy backend routes gracefully", () => {

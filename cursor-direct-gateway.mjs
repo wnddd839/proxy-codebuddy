@@ -71,8 +71,8 @@ const config = {
   codeBuddyBaseUrl:
     process.env.CURSOR_DIRECT_CODEBUDDY_BASE_URL ||
     process.env.CODEBUDDY_BASE_URL ||
-    "http://127.0.0.1:8080",
-  codeBuddyModels: process.env.CURSOR_DIRECT_CODEBUDDY_MODELS || "codebuddy/default",
+    "https://www.codebuddy.cn",
+  codeBuddyModels: process.env.CURSOR_DIRECT_CODEBUDDY_MODELS || "codebuddy/claude-sonnet-4.5,codebuddy/claude-opus-4.5,codebuddy/gpt-5.1",
   apiBaseUrl: process.env.CURSOR_DIRECT_API_BASE_URL || "https://api2.cursor.sh",
   agentHost: process.env.CURSOR_DIRECT_AGENT_HOST || "agentn.api5.cursor.sh",
   clientVersion: process.env.CURSOR_DIRECT_CLIENT_VERSION || "cli-2026.05.24-dda726e",
@@ -912,6 +912,10 @@ function normalizeCodeBuddyLoginStatus(value = {}) {
     authenticated,
     loggedIn: authenticated,
     accessAllowed,
+    userId: compactText(source.userId || source.user_id || source.id || ""),
+    userName: compactText(source.userName || source.username || source.email || source.name || ""),
+    userNickname: compactText(source.userNickname || source.nickname || source.displayName || ""),
+    authMode: compactText(source.authMode || source.auth_mode || source.mode || ""),
     message: compactText(source.message || source.statusMessage || source.error || source.note || ""),
     raw: {
       authEnabled,
@@ -1047,70 +1051,307 @@ function normalizeCodeBuddySessionUrl(value, options = {}) {
   return buildCodeBuddyOAuthLaunchUrl(options);
 }
 
-function normalizeCodeBuddyExternalLoginUrl(value) {
-  const url = normalizeCodeBuddyLoginUrl(value);
-  if (!url || isCodeBuddyOAuthLaunchUrl(url)) return "";
-  return url;
+function sanitizeCodeBuddyCookieHeader(value) {
+  let text = String(value || "").trim();
+  text = text.replace(/^\s*(?:-H|--header)\s+/i, "").trim();
+  text = text.replace(/^['"]|['"]$/g, "").trim();
+  text = text.replace(/^Cookie\s*:\s*/i, "").trim();
+  text = text.replace(/\\\s*$/g, "").trim();
+  text = text.replace(/^['"]|['"]$/g, "").trim();
+  text = text.replace(/['"]\s*$/g, "").trim();
+  const cookies = parseCookieHeader(text);
+  if (cookies.size === 0) return "";
+  cookies.delete("cursor_codebuddy_oauth");
+  for (const attr of ["path", "expires", "max-age", "domain", "samesite", "secure", "httponly"]) {
+    cookies.delete(attr);
+    cookies.delete(attr.toUpperCase());
+    cookies.delete(attr.replace(/(^|-)([a-z])/g, (_m, prefix, char) => `${prefix}${char.toUpperCase()}`));
+  }
+  return Array.from(cookies.entries())
+    .filter(([key]) => key)
+    .map(([key, val]) => `${key}=${val}`)
+    .join("; ");
 }
 
-function findCodeBuddyLoginUrl(value, seen = new Set()) {
-  if (!value || typeof value !== "object" || seen.has(value)) return "";
-  seen.add(value);
-  for (const key of ["loginUrl", "authUrl", "authorizationUrl", "authorizeUrl", "redirectUrl", "verificationUriComplete", "verificationUrl", "url"]) {
-    const url = normalizeCodeBuddyLoginUrl(value[key]);
-    if (url) return url;
+function looksLikeCookieHeader(value) {
+  const text = compactText(value);
+  return /^[A-Za-z0-9_.-]+=[^;]+(?:;\s*[A-Za-z0-9_.-]+=[^;]+)*$/.test(text);
+}
+
+function parseCodeBuddyGatewayCredentialInput(value = "", options = {}) {
+  const text = compactText(value);
+  const result = {
+    ok: false,
+    source: "",
+    raw: text,
+    baseUrl: "",
+    authToken: "",
+    cookie: "",
+  };
+
+  const cookieFromOptions = sanitizeCodeBuddyCookieHeader(options.cookieHeader || "");
+  if (cookieFromOptions) {
+    result.cookie = cookieFromOptions;
+    result.source = "browser_cookie";
   }
-  for (const [key, entry] of Object.entries(value)) {
-    if (/token|secret|password|api[_-]?key|base[_-]?url|endpoint|host|origin/i.test(key)) continue;
-    if (typeof entry === "string") {
-      const url = normalizeCodeBuddyLoginUrl(entry);
-      if (url) return url;
+
+  if (!text) {
+    result.ok = Boolean(result.cookie);
+    return result;
+  }
+
+  const loosePassword = text.match(/^\??(?:password|token|auth|access_token)=([^&\s]+)/i);
+  if (loosePassword) {
+    result.authToken = decodeURIComponent(loosePassword[1]);
+    result.source = "password_param";
+    result.ok = Boolean(result.authToken || result.cookie);
+    return result;
+  }
+
+  if (looksLikeCookieHeader(text)) {
+    result.cookie = sanitizeCodeBuddyCookieHeader(text);
+    result.source = result.source || "cookie";
+    result.ok = Boolean(result.cookie);
+    return result;
+  }
+
+  const bearer = text.match(/^Bearer\s+(.+)$/i);
+  if (bearer) {
+    result.authToken = compactText(bearer[1]);
+    result.source = "bearer";
+    result.ok = Boolean(result.authToken || result.cookie);
+    return result;
+  }
+
+  try {
+    const parsed = new URL(text, "http://localhost");
+    const password = compactText(
+      parsed.searchParams.get("password") ||
+      parsed.searchParams.get("token") ||
+      parsed.searchParams.get("auth") ||
+      parsed.searchParams.get("access_token") ||
+      "",
+    );
+    const cookie = compactText(parsed.searchParams.get("cookie") || "");
+    if (password) result.authToken = password;
+    if (cookie) result.cookie = sanitizeCodeBuddyCookieHeader(cookie) || cookie;
+    if (/^https?:\/\//i.test(text) && !parsed.pathname.startsWith("/direct-admin/")) {
+      result.baseUrl = parsed.origin;
     }
-    if (entry && typeof entry === "object") {
-      const nested = findCodeBuddyLoginUrl(entry, seen);
-      if (nested) return nested;
-    }
+    result.source = result.authToken ? "url_password" : (result.cookie ? "url_cookie" : "url");
+    result.ok = Boolean(result.authToken || result.cookie || result.baseUrl);
+    return result;
+  } catch {
+    // Plain gateway password/token.
+  }
+
+  result.authToken = text;
+  result.source = "token";
+  result.ok = Boolean(result.authToken || result.cookie);
+  return result;
+}
+
+function createCodeBuddyCredentialHeaders(credential = {}, options = {}) {
+  const headers = createCodeBuddyHeaders({
+    token: compactText(credential.authToken || options.authToken || options.token || ""),
+    exemptRequestHeader: true,
+  });
+  const cookie = sanitizeCodeBuddyCookieHeader(credential.cookie || options.cookieHeader || options.cookie || "");
+  if (cookie) headers.cookie = cookie;
+  return headers;
+}
+
+function firstCodeBuddyCredentialText(...values) {
+  for (const value of values) {
+    const text = compactText(value);
+    if (text) return text;
   }
   return "";
 }
 
-function summarizeCodeBuddyLoginResponse(value = {}) {
-  const source = value && typeof value === "object" ? value : {};
-  return {
-    success: Boolean(source.success === true || source.ok === true || source.data?.success === true),
-    message: compactText(source.message || source.error || source.data?.message || source.data?.error || ""),
-    url: findCodeBuddyLoginUrl(source) || "",
+function stripWrappedSecret(value) {
+  return compactText(value).replace(/^['"]|['"]$/g, "");
+}
+
+function looksLikeCodeBuddySecretValue(value) {
+  const text = stripWrappedSecret(value);
+  if (!text) return false;
+  if (/^\d{10,}$/.test(text)) return false;
+  if (/^[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}$/i.test(text)) return false;
+  if (text.length < 16) return false;
+  if (/^eyJ[A-Za-z0-9_-]*\./.test(text)) return true;
+  return /[A-Za-z]/.test(text) && /[A-Za-z0-9]/.test(text);
+}
+
+function parseCodeBuddyCredentialEnvText(text = {}) {
+  const raw = String(text || "");
+  const result = {
+    apiKey: "",
+    baseUrl: "",
   };
+  const read = (pattern) => {
+    const match = raw.match(pattern);
+    return match ? stripWrappedSecret(match[1] || "") : "";
+  };
+
+  result.apiKey = read(/(?:^|\n|\s)(?:CODEBUDDY_API_KEY|API_KEY|api_key|apiKey|x-api-key)\s*[:=]\s*["']?([^\s"',;]+)/i);
+  result.baseUrl = read(/(?:^|\n|\s)(?:CODEBUDDY_BASE_URL|baseUrl|base_url)\s*[:=]\s*["']?([^\s"',;]+)/i);
+
+  const apiHeader = raw.match(/(?:x-api-key|X-API-Key)\s*[:=]\s*["']?([^\s"',;]+)/);
+  if (!result.apiKey && apiHeader) result.apiKey = stripWrappedSecret(apiHeader[1]);
+
+  return result;
+}
+
+function shouldUseCodeBuddyCredentialBaseUrl(value) {
+  const text = compactText(value);
+  if (!text) return false;
+  try {
+    const parsed = new URL(text);
+    const host = parsed.hostname.toLowerCase();
+    if (host === "codebuddy.ai" || host.endsWith(".codebuddy.ai")) return false;
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function collectCodeBuddyCredentialFields(value, out = {}, seen = new Set()) {
+  if (!value || typeof value !== "object" || seen.has(value)) return out;
+  seen.add(value);
+  for (const [key, entry] of Object.entries(value)) {
+    const normalizedKey = key.replace(/[-_\s]/g, "").toLowerCase();
+    if (typeof entry === "string" || typeof entry === "number") {
+      const text = compactText(entry);
+      if (!text) continue;
+      if (["apikey", "codebuddyapikey", "xapikey", "x-apikey", "key"].includes(normalizedKey)) {
+        out.apiKey ||= text;
+      } else if (["baseurl"].includes(normalizedKey) && shouldUseCodeBuddyCredentialBaseUrl(text)) {
+        out.baseUrl ||= text;
+      } else if (["site", "region", "codebuddysite", "codebuddyregion"].includes(normalizedKey)) {
+        out.site ||= text;
+      } else if (["weborigin", "weburl", "origin", "url"].includes(normalizedKey)) {
+        out.webOrigin ||= text;
+      } else if (["label", "name", "email", "username"].includes(normalizedKey)) {
+        out.label ||= text;
+      }
+      continue;
+    }
+    if (entry && typeof entry === "object") collectCodeBuddyCredentialFields(entry, out, seen);
+  }
+  return out;
+}
+
+function normalizeCodeBuddyImportSite(value) {
+  const text = compactText(value).toLowerCase();
+  if (["domestic", "cn", "china", "internal"].includes(text)) return "domestic";
+  return "global";
+}
+
+function getCodeBuddyImportBaseUrl(site) {
+  return normalizeCodeBuddyImportSite(site) === "domestic"
+    ? "https://www.codebuddy.cn"
+    : "https://www.codebuddy.ai";
+}
+
+function createCodeBuddyAccountFromCredential(input = {}, options = {}) {
+  const source = input && typeof input === "object" ? input : {};
+  const site = normalizeCodeBuddyImportSite(source.site || source.codeBuddySite || source.codebuddy_site || options.site);
+  const baseUrl = normalizeCodeBuddyBaseUrl(source.baseUrl || options.baseUrl || getCodeBuddyImportBaseUrl(site) || config.codeBuddyBaseUrl);
+  const apiKey = compactText(source.apiKey || "");
+  const account = {
+    label: compactText(source.label || options.label || "CodeBuddy Account"),
+    site,
+    baseUrl: baseUrl,
+    source: "manual",
+    apiKey,
+  };
+  if (!account.apiKey) {
+    return null;
+  }
+  return account;
+}
+
+function normalizeCodeBuddyCredentialImportRequest(body = {}) {
+  const source = body && typeof body === "object" ? body : {};
+  if (Array.isArray(source.accounts)) return source;
+  if (source.account && typeof source.account === "object") return { accounts: [source.account] };
+
+  const label = compactText(source.label || source.accountLabel || "CodeBuddy Account");
+  const site = normalizeCodeBuddyImportSite(source.site || source.codeBuddySite || source.codebuddy_site);
+  const baseUrl = normalizeCodeBuddyBaseUrl(source.baseUrl || getCodeBuddyImportBaseUrl(site) || config.codeBuddyBaseUrl);
+  const text = firstCodeBuddyCredentialText(
+    source.credentialText,
+    source.credential,
+    source.authJson,
+    source.raw,
+    source.text,
+    source.token,
+    source.apiKey,
+  );
+  const accounts = [];
+  const add = (candidate) => {
+    const account = createCodeBuddyAccountFromCredential(candidate, { label, site, baseUrl });
+    if (account) accounts.push(account);
+  };
+
+  const apiKeyCandidate = compactText(source.apiKey || source.api_key || source["x-api-key"] || source.key || "");
+  if (apiKeyCandidate) add({ label, site, baseUrl, apiKey: apiKeyCandidate });
+
+  if (text) {
+    let parsedJson = null;
+    try {
+      parsedJson = JSON.parse(text);
+    } catch {
+      parsedJson = null;
+    }
+    if (parsedJson) {
+      if (Array.isArray(parsedJson)) {
+        for (const item of parsedJson) add(collectCodeBuddyCredentialFields(item, { label, site, baseUrl }));
+      } else if (Array.isArray(parsedJson.accounts)) {
+        for (const item of parsedJson.accounts) add(collectCodeBuddyCredentialFields(item, { label, site, baseUrl }));
+      } else {
+        add(collectCodeBuddyCredentialFields(parsedJson, { label, site, baseUrl }));
+      }
+    }
+    const envFields = parseCodeBuddyCredentialEnvText(text);
+    add({ label, site, baseUrl, ...envFields });
+    if (!parsedJson) add({ label, site, baseUrl, apiKey: text });
+  }
+
+  const unique = [];
+  const seen = new Set();
+  for (const account of accounts) {
+    const key = [account.apiKey, account.baseUrl].join("|");
+    if (seen.has(key)) continue;
+    seen.add(key);
+    unique.push(account);
+  }
+
+  return { accounts: unique };
 }
 
 function buildCodeBuddyOAuthSessionResponse(options = {}) {
-  const launchUrl = buildCodeBuddyOAuthLaunchUrl({
+  const gatewayLaunchUrl = buildCodeBuddyOAuthLaunchUrl({
     publicOrigin: options.publicOrigin,
     id: codeBuddyOAuthSession.id,
     token: codeBuddyOAuthSession.token,
   });
-  const sessionUrl = normalizeCodeBuddySessionUrl(codeBuddyOAuthSession.url || launchUrl, {
-    publicOrigin: options.publicOrigin,
-    id: codeBuddyOAuthSession.id,
-    token: codeBuddyOAuthSession.token,
-  }) || launchUrl;
+  const sessionUrl = compactText(codeBuddyOAuthSession.url || codeBuddyOAuthSession.login?.url || "");
   const login = codeBuddyOAuthSession.login && typeof codeBuddyOAuthSession.login === "object"
     ? {
       success: Boolean(codeBuddyOAuthSession.login.success),
       message: compactText(codeBuddyOAuthSession.login.message || ""),
-      url: normalizeCodeBuddySessionUrl(codeBuddyOAuthSession.login.url || sessionUrl, {
-        publicOrigin: options.publicOrigin,
-        id: codeBuddyOAuthSession.id,
-        token: codeBuddyOAuthSession.token,
-      }),
+      url: compactText(codeBuddyOAuthSession.login.url || sessionUrl),
     }
     : null;
   return {
     id: codeBuddyOAuthSession.id,
     provider: codeBuddyOAuthSession.provider,
     status: codeBuddyOAuthSession.status,
-    url: launchUrl || sessionUrl,
-    launchUrl: launchUrl || sessionUrl,
+    url: sessionUrl,
+    launchUrl: gatewayLaunchUrl,
+    gatewayLaunchUrl,
     accessUrl: codeBuddyOAuthSession.accessUrl || buildCodeBuddyRemoteUrl({ publicOrigin: options.publicOrigin }),
     callbackUrl: codeBuddyOAuthSession.callbackUrl,
     startedAt: codeBuddyOAuthSession.startedAt,
@@ -1148,14 +1389,14 @@ function buildCodeBuddyOAuthLaunchPage(message, options = {}) {
     "<head>",
     '  <meta charset="utf-8" />',
     '  <meta name="viewport" content="width=device-width, initial-scale=1" />',
-    "  <title>CodeBuddy OAuth</title>",
+    "  <title>CodeBuddy Gateway Login</title>",
     "  <style>body{font-family:system-ui,sans-serif;max-width:720px;margin:48px auto;padding:0 20px;line-height:1.6;color:#111}a,button{display:inline-block;margin-top:12px;padding:10px 14px;border-radius:8px;border:1px solid #111;text-decoration:none;color:#fff;background:#111}p{white-space:pre-wrap} .muted{color:#666}</style>",
     "</head>",
     "<body>",
-    "  <h1>CodeBuddy OAuth</h1>",
+    "  <h1>CodeBuddy Gateway Login</h1>",
     `  <p>${escapeHtmlText(message || "")}</p>`,
     launchUrl ? `  <p class="muted">登录入口：<a href="${escapeHtmlText(launchUrl)}">${escapeHtmlText(launchUrl)}</a></p>` : "",
-    `  <p class="muted">授权完成后回到管理台，粘贴最终回调地址或直接点击检查。</p>`,
+    `  <p class="muted">登录完成后回到管理台，粘贴最终回调/登录链接或直接点击检查。</p>`,
     `  <p><a href="/direct-admin/#codebuddy">返回管理台</a></p>`,
     "</body>",
     "</html>",
@@ -1171,28 +1412,45 @@ function createCodeBuddyDaemonAccount(authStatus, options = {}) {
   const baseUrl = normalizeCodeBuddyBaseUrl(options.baseUrl || config.codeBuddyBaseUrl);
   const normalizedAuthStatus = normalizeCodeBuddyLoginStatus(authStatus);
   const confirmed = Boolean(options.confirmed);
+  const authToken = compactText(options.authToken || "");
+  const cookie = sanitizeCodeBuddyCookieHeader(options.cookie || "");
+  const authType = authToken ? "auth_token" : (cookie ? "cookie" : "daemon");
   return {
-    id: getCodeBuddyDaemonAccountId(baseUrl),
-    label: compactText(options.label || "CodeBuddy OAuth"),
-    source: "oauth",
+    id: authToken || cookie
+      ? createHash("sha256").update(`${baseUrl}|${authToken || cookie}`).digest("hex").slice(0, 16)
+      : getCodeBuddyDaemonAccountId(baseUrl),
+    label: compactText(options.label || "CodeBuddy Gateway"),
+    source: "gateway",
     baseUrl,
-    authType: "daemon",
-    useDaemonAuth: true,
+    authType,
+    useDaemonAuth: !authToken && !cookie,
+    authToken,
+    cookie,
     enabled: true,
     authStatus: {
       ...normalizedAuthStatus,
       loggedIn: confirmed || Boolean(normalizedAuthStatus.loggedIn),
       authenticated: confirmed || Boolean(normalizedAuthStatus.authenticated),
       accessAllowed: Boolean(normalizedAuthStatus.accessAllowed),
-      authMode: confirmed ? "daemon_oauth" : normalizedAuthStatus.raw?.authMode || "daemon",
+      authMode: confirmed ? (normalizedAuthStatus.authMode || authType || "gateway") : normalizedAuthStatus.raw?.authMode || "daemon",
       confirmedAt: confirmed ? Date.now() : 0,
     },
   };
 }
 
-async function fetchCodeBuddyAuthStatus() {
-  const response = await fetch(`${normalizeCodeBuddyBaseUrl(config.codeBuddyBaseUrl)}/api/v1/auth/status`, {
-    headers: createCodeBuddyHeaders({ exemptRequestHeader: true }),
+async function fetchCodeBuddyAuthStatus(options = {}) {
+  const credential = options.credential && typeof options.credential === "object"
+    ? options.credential
+    : {
+      authToken: options.authToken || options.token || "",
+      cookie: options.cookie || options.cookieHeader || "",
+    };
+  const baseUrl = normalizeCodeBuddyBaseUrl(credential.baseUrl || options.baseUrl || config.codeBuddyBaseUrl);
+  const response = await fetch(`${baseUrl}/api/v1/auth/status`, {
+    headers: createCodeBuddyCredentialHeaders(credential, {
+      token: options.token,
+      cookieHeader: options.cookieHeader,
+    }),
   });
   const text = await response.text();
   let data = {};
@@ -1207,26 +1465,7 @@ async function fetchCodeBuddyAuthStatus() {
   return normalizeCodeBuddyLoginStatus(data);
 }
 
-async function triggerCodeBuddyAuthLogin() {
-  const response = await fetch(`${normalizeCodeBuddyBaseUrl(config.codeBuddyBaseUrl)}/api/v1/auth/login`, {
-    method: "POST",
-    headers: createCodeBuddyHeaders({ exemptRequestHeader: true }),
-    body: "{}",
-  });
-  const text = await response.text();
-  let data = {};
-  try {
-    data = text ? JSON.parse(text) : {};
-  } catch {
-    data = {};
-  }
-  if (!response.ok) {
-    throw new Error(`CodeBuddy auth/login failed with ${response.status}`);
-  }
-  return summarizeCodeBuddyLoginResponse(data);
-}
-
-function importCodeBuddyDaemonAccount(authStatus, options = {}) {
+function importCodeBuddyGatewayAccount(authStatus, options = {}) {
   const account = createCodeBuddyDaemonAccount(authStatus, options);
   const result = importCodeBuddyAccounts(readCodeBuddyStore(), { accounts: [account] });
   const store = writeCodeBuddyStore(result.store);
@@ -1260,9 +1499,8 @@ async function getCodeBuddyOAuthSessionPayload(options = {}) {
       },
     };
   }
-  let authStatus = null;
   try {
-    authStatus = await fetchCodeBuddyAuthStatus();
+    const authStatus = await fetchCodeBuddyAuthStatus({ cookieHeader: options.cookieHeader || "" });
     codeBuddyOAuthSession.authStatus = authStatus;
   } catch (error) {
     codeBuddyOAuthSession.error = error instanceof Error ? error.message : String(error);
@@ -1273,7 +1511,7 @@ async function getCodeBuddyOAuthSessionPayload(options = {}) {
     provider: "codebuddy",
     session: buildCodeBuddyOAuthSessionResponse({
       publicOrigin: options.publicOrigin,
-      authenticated: Boolean(authStatus?.authenticated),
+      authenticated: Boolean(codeBuddyOAuthSession.status === "complete" || codeBuddyOAuthSession.authStatus?.authenticated),
     }),
     accounts,
     account: accounts.primary,
@@ -1282,50 +1520,43 @@ async function getCodeBuddyOAuthSessionPayload(options = {}) {
 }
 
 async function startCodeBuddyOAuthSession(options = {}) {
-  if ((codeBuddyOAuthSession.status === "starting" || codeBuddyOAuthSession.status === "waiting") &&
+  if ((codeBuddyOAuthSession.status === "starting" || codeBuddyOAuthSession.status === "waiting" || codeBuddyOAuthSession.status === "unsupported") &&
     isCodeBuddyOAuthSessionActive(codeBuddyOAuthSession)) {
     return getCodeBuddyOAuthSessionPayload({ fresh: true, publicOrigin: options.publicOrigin });
   }
   codeBuddyOAuthSession = createCodeBuddyOAuthSessionState();
   codeBuddyOAuthSession.id = `${Date.now()}-${Math.random().toString(16).slice(2)}`;
   codeBuddyOAuthSession.token = randomUUID();
-  codeBuddyOAuthSession.status = "waiting";
+  codeBuddyOAuthSession.status = "unsupported";
   codeBuddyOAuthSession.startedAt = Date.now();
   codeBuddyOAuthSession.updatedAt = codeBuddyOAuthSession.startedAt;
-  codeBuddyOAuthSession.label = compactText(options.label || "CodeBuddy OAuth");
+  codeBuddyOAuthSession.label = compactText(options.label || "CodeBuddy Gateway");
   codeBuddyOAuthSession.launchUrl = buildCodeBuddyOAuthLaunchUrl({
     publicOrigin: options.publicOrigin,
     id: codeBuddyOAuthSession.id,
     token: codeBuddyOAuthSession.token,
   });
   codeBuddyOAuthSession.accessUrl = buildCodeBuddyRemoteUrl({ publicOrigin: options.publicOrigin });
-  codeBuddyOAuthSession.url = codeBuddyOAuthSession.launchUrl;
+  codeBuddyOAuthSession.callbackUrl = buildCodeBuddyOAuthCallbackUrl({
+    publicOrigin: options.publicOrigin,
+    id: codeBuddyOAuthSession.id,
+    token: codeBuddyOAuthSession.token,
+  });
+  codeBuddyOAuthSession.error = "CodeBuddy uses API Key import mode; paste a CodeBuddy API key into the admin panel.";
+  codeBuddyOAuthSession.login = {
+    success: false,
+    message: codeBuddyOAuthSession.error,
+    url: "",
+    externalUrl: "",
+  };
   clearMetadataCache(metadataCaches.codeBuddyOAuthSession);
-
-  try {
-    const login = await triggerCodeBuddyAuthLogin();
-    const externalUrl = normalizeCodeBuddyExternalLoginUrl(login.url || "");
-    codeBuddyOAuthSession.login = {
-      ...login,
-      url: externalUrl || codeBuddyOAuthSession.launchUrl,
-      externalUrl,
-    };
-    codeBuddyOAuthSession.error = login.message || "";
-  } catch (error) {
-    codeBuddyOAuthSession.login = {
-      success: false,
-      message: error instanceof Error ? error.message : String(error),
-      url: codeBuddyOAuthSession.launchUrl,
-    };
-    codeBuddyOAuthSession.error = codeBuddyOAuthSession.login.message;
-  }
 
   codeBuddyOAuthSession.updatedAt = Date.now();
   clearMetadataCache(metadataCaches.codeBuddyOAuthSession);
   return getCodeBuddyOAuthSessionPayload({ fresh: true, publicOrigin: options.publicOrigin });
 }
 
-async function waitForCodeBuddyOAuthCompletion(callbackUrl = "", options = {}) {
+async function completeCodeBuddyGatewayAuth(callbackUrl = "", options = {}) {
   const rawCallbackUrl = String(callbackUrl || "").trim();
   const tokenCallback = rawCallbackUrl
     ? parseCodeBuddyOAuthCallbackUrl(rawCallbackUrl, codeBuddyOAuthSession)
@@ -1333,11 +1564,16 @@ async function waitForCodeBuddyOAuthCompletion(callbackUrl = "", options = {}) {
   const manualCallback = rawCallbackUrl && !tokenCallback.ok
     ? parseCodeBuddyManualCallbackUrl(rawCallbackUrl)
     : { ok: false, reason: "empty callback url" };
-  const callbackConfirmed = Boolean(rawCallbackUrl && (tokenCallback.ok || manualCallback.ok));
+  const gatewayCredential = parseCodeBuddyGatewayCredentialInput(rawCallbackUrl, {
+    cookieHeader: options.cookieHeader,
+    publicOrigin: options.publicOrigin,
+  });
+  const hasCredential = Boolean(gatewayCredential.authToken || gatewayCredential.cookie);
+  const callbackConfirmed = Boolean(rawCallbackUrl && (tokenCallback.ok || manualCallback.ok || gatewayCredential.ok));
 
-  if (rawCallbackUrl && !callbackConfirmed) {
+  if (rawCallbackUrl && !callbackConfirmed && !hasCredential) {
     codeBuddyOAuthSession.status = codeBuddyOAuthSession.status === "complete" ? "complete" : "waiting";
-    codeBuddyOAuthSession.error = `CodeBuddy OAuth 回调无效：${manualCallback.reason || tokenCallback.reason}`;
+    codeBuddyOAuthSession.error = `CodeBuddy 登录结果无效：${manualCallback.reason || tokenCallback.reason}`;
     codeBuddyOAuthSession.updatedAt = Date.now();
     clearMetadataCache(metadataCaches.codeBuddyOAuthSession);
     const accounts = summarizeCodeBuddyStore(readCodeBuddyStore());
@@ -1362,7 +1598,11 @@ async function waitForCodeBuddyOAuthCompletion(callbackUrl = "", options = {}) {
 
   let authStatus = null;
   try {
-    authStatus = await fetchCodeBuddyAuthStatus();
+    authStatus = await fetchCodeBuddyAuthStatus({
+      credential: gatewayCredential,
+      cookieHeader: gatewayCredential.cookie || options.cookieHeader || "",
+      baseUrl: gatewayCredential.baseUrl || config.codeBuddyBaseUrl,
+    });
   } catch (error) {
     codeBuddyOAuthSession.status = "waiting";
     codeBuddyOAuthSession.error = `CodeBuddy daemon 不可访问：${error instanceof Error ? error.message : String(error)}`;
@@ -1382,9 +1622,13 @@ async function waitForCodeBuddyOAuthCompletion(callbackUrl = "", options = {}) {
   }
 
   codeBuddyOAuthSession.authStatus = authStatus;
-  if (!callbackConfirmed && !authStatus.authenticated) {
+  const canImportDaemon = false;
+  const canImportCredential = hasCredential && (authStatus.authenticated || authStatus.accessAllowed);
+  if (!canImportDaemon && !canImportCredential) {
     codeBuddyOAuthSession.status = "waiting";
-    codeBuddyOAuthSession.error = "尚未检测到 CodeBuddy 账号登录态；请完成 Web 登录后重试，或粘贴授权后的回调地址。";
+    codeBuddyOAuthSession.error = hasCredential
+      ? "CodeBuddy token/cookie 未通过 auth/status 校验，请确认粘贴的是 Gateway 登录链接或 password token。"
+      : "尚未检测到 CodeBuddy Web 登录态；请打开 Web UI 登录后重试，或粘贴带 password 的 Gateway 链接 / token。";
     codeBuddyOAuthSession.updatedAt = Date.now();
     clearMetadataCache(metadataCaches.codeBuddyOAuthSession);
     const accounts = summarizeCodeBuddyStore(readCodeBuddyStore());
@@ -1400,8 +1644,12 @@ async function waitForCodeBuddyOAuthCompletion(callbackUrl = "", options = {}) {
     };
   }
 
-  const imported = importCodeBuddyDaemonAccount(authStatus, {
-    label: codeBuddyOAuthSession.label || "CodeBuddy OAuth",
+  const shouldStoreCredential = authStatus.authEnabled !== false && canImportCredential;
+  const imported = importCodeBuddyGatewayAccount(authStatus, {
+    label: codeBuddyOAuthSession.label || "CodeBuddy Gateway",
+    baseUrl: gatewayCredential.baseUrl || config.codeBuddyBaseUrl,
+    authToken: shouldStoreCredential ? gatewayCredential.authToken : "",
+    cookie: shouldStoreCredential && !gatewayCredential.authToken ? gatewayCredential.cookie : "",
     confirmed: true,
   });
   codeBuddyOAuthSession.status = "complete";
@@ -1419,6 +1667,10 @@ async function waitForCodeBuddyOAuthCompletion(callbackUrl = "", options = {}) {
     accounts: imported.accounts,
     account: imported.account,
   };
+}
+
+async function waitForCodeBuddyOAuthCompletion(callbackUrl = "", options = {}) {
+  return completeCodeBuddyGatewayAuth(callbackUrl, options);
 }
 
 function resolveCursorAgentBinary() {
@@ -3721,7 +3973,7 @@ function createCodeBuddyProxyResponseHeaders(upstreamResponse, targetUrl, public
 
 async function handleCodeBuddyRemoteProxy(req, res, url) {
   if (!isCodeBuddyOAuthLaunchAuthorized(req)) {
-    const response = openAiError(401, "authentication_error", "CodeBuddy OAuth session required");
+    const response = openAiError(401, "authentication_error", "CodeBuddy gateway login session required");
     res.writeHead(response.status, response.headers);
     res.end(response.body);
     return;
@@ -3834,10 +4086,13 @@ function handleCodeBuddyRemoteUpgrade(req, socket, head) {
 async function handleCodeBuddyOAuthCallback(req, res, url) {
   const publicOrigin = getPublicOrigin(req);
   try {
-    const result = await waitForCodeBuddyOAuthCompletion(url.toString(), { publicOrigin });
+    const result = await waitForCodeBuddyOAuthCompletion(url.toString(), {
+      publicOrigin,
+      cookieHeader: req.headers.cookie || "",
+    });
     const message = result.ok
-      ? "CodeBuddy OAuth 已确认，账号已导入账号池。"
-      : result.session?.error || codeBuddyOAuthSession.error || "CodeBuddy OAuth 尚未完成。";
+      ? "CodeBuddy 登录已确认，账号已导入账号池。"
+      : result.session?.error || codeBuddyOAuthSession.error || "CodeBuddy 登录尚未完成。";
     const response = buildCodeBuddyOAuthLaunchPage(message, { publicOrigin });
     res.writeHead(result.ok ? 200 : 409, {
       ...response.headers,
@@ -3847,7 +4102,7 @@ async function handleCodeBuddyOAuthCallback(req, res, url) {
     res.end(response.body);
   } catch (error) {
     const response = buildCodeBuddyOAuthLaunchPage(
-      `CodeBuddy OAuth 回调失败：${error instanceof Error ? error.message : String(error)}`,
+      `CodeBuddy 登录回调失败：${error instanceof Error ? error.message : String(error)}`,
       { publicOrigin },
     );
     res.writeHead(500, {
@@ -3897,7 +4152,7 @@ async function handleCodeBuddyOAuthLaunch(req, res, url) {
   const setCookie = `cursor_codebuddy_oauth=${encodeURIComponent(token)}; Path=/; Max-Age=900; HttpOnly; SameSite=Lax`;
   const deny = () => {
     const response = html(403, buildCodeBuddyOAuthLaunchPage(
-      "授权入口已失效或参数不正确，请回到管理台重新生成 CodeBuddy OAuth 登录入口。",
+      "登录入口已失效或参数不正确，请回到管理台重新生成 CodeBuddy 登录入口。",
       { publicOrigin },
     ).body);
     res.writeHead(response.status, response.headers);
@@ -3910,45 +4165,31 @@ async function handleCodeBuddyOAuthLaunch(req, res, url) {
   }
 
   try {
-    codeBuddyOAuthSession.status = "waiting";
+    codeBuddyOAuthSession.status = "unsupported";
     codeBuddyOAuthSession.launchUrl ||= buildCodeBuddyOAuthLaunchUrl({ publicOrigin, id, token });
     codeBuddyOAuthSession.accessUrl = buildCodeBuddyRemoteUrl({ publicOrigin });
     codeBuddyOAuthSession.callbackUrl ||= buildCodeBuddyOAuthCallbackUrl({ publicOrigin, id, token });
-    codeBuddyOAuthSession.status = "waiting";
+    codeBuddyOAuthSession.error = "CodeBuddy uses API Key import mode; paste a CodeBuddy API key into the admin panel.";
     codeBuddyOAuthSession.updatedAt = Date.now();
-
-    let login = codeBuddyOAuthSession.login;
-    let loginUrl = normalizeCodeBuddyExternalLoginUrl(login?.externalUrl || login?.url || "");
-    if (!loginUrl) {
-      login = await triggerCodeBuddyAuthLogin().catch((error) => ({
-        success: false,
-        message: error instanceof Error ? error.message : String(error),
-        url: "",
-      }));
-      loginUrl = normalizeCodeBuddyExternalLoginUrl(login.url || "");
-      codeBuddyOAuthSession.login = {
-        ...login,
-        url: loginUrl || codeBuddyOAuthSession.launchUrl,
-        externalUrl: loginUrl,
-      };
-      codeBuddyOAuthSession.error = login.success ? "" : (login.message || "");
-    }
-
     clearMetadataCache(metadataCaches.codeBuddyOAuthSession);
 
-    res.writeHead(302, {
-      location: loginUrl || buildCodeBuddyRemoteUrl({ publicOrigin: "" }),
+    const response = buildCodeBuddyOAuthLaunchPage(
+      "CodeBuddy 当前使用 API Key 导入模式。请回到管理台，粘贴 API Key 导入账号池。",
+      { publicOrigin },
+    );
+    res.writeHead(409, {
+      ...response.headers,
       "set-cookie": setCookie,
       "cache-control": "no-store",
     });
-    res.end();
+    res.end(response.body);
   } catch (error) {
     codeBuddyOAuthSession.status = "failed";
     codeBuddyOAuthSession.error = error instanceof Error ? error.message : String(error);
     codeBuddyOAuthSession.updatedAt = Date.now();
     clearMetadataCache(metadataCaches.codeBuddyOAuthSession);
     const response = buildCodeBuddyOAuthLaunchPage(
-      `CodeBuddy OAuth 启动失败：${codeBuddyOAuthSession.error}`,
+      `CodeBuddy 登录入口启动失败：${codeBuddyOAuthSession.error}`,
       { publicOrigin },
     );
     res.writeHead(500, {
@@ -4142,7 +4383,9 @@ async function handle(req, res) {
 
     if (routePath === "/direct-admin/api/codebuddy/status" && req.method === "GET") {
       try {
-        const authStatus = await fetchCodeBuddyAuthStatus().catch(() => null);
+        const authStatus = await fetchCodeBuddyAuthStatus({
+          cookieHeader: req.headers.cookie || "",
+        }).catch(() => null);
         const response = json(200, {
           ok: true,
           provider: "codebuddy",
@@ -4166,6 +4409,7 @@ async function handle(req, res) {
         const response = json(200, await getCodeBuddyOAuthSessionPayload({
           fresh: url.searchParams.get("fresh") === "1",
           publicOrigin: getPublicOrigin(req),
+          cookieHeader: req.headers.cookie || "",
         }));
         res.writeHead(response.status, response.headers);
         res.end(response.body);
@@ -4199,6 +4443,7 @@ async function handle(req, res) {
         const body = await readRequestBody(req).catch(() => ({}));
         const response = json(200, await waitForCodeBuddyOAuthCompletion(body?.callbackUrl || body?.url || "", {
           publicOrigin: getPublicOrigin(req),
+          cookieHeader: req.headers.cookie || "",
         }));
         res.writeHead(response.status, response.headers);
         res.end(response.body);
@@ -4226,7 +4471,8 @@ async function handle(req, res) {
     if (routePath === "/direct-admin/api/codebuddy/accounts/import" && req.method === "POST") {
       try {
         const body = await readRequestBody(req);
-        const result = importCodeBuddyAccounts(readCodeBuddyStore(), body);
+        const importBody = normalizeCodeBuddyCredentialImportRequest(body);
+        const result = importCodeBuddyAccounts(readCodeBuddyStore(), importBody);
         if (result.imported.length === 0) throw new Error("No CodeBuddy accounts found in request body");
         const store = writeCodeBuddyStore(result.store);
         const response = json(200, {
@@ -5475,6 +5721,7 @@ export {
   isDirectAdminAuthorized,
   listDirectModels,
   normalizeApiPath,
+  normalizeCodeBuddyCredentialImportRequest,
   normalizeDirectModel,
   normalizePublicModelName,
   normalizeCodeBuddyLoginStatus,
@@ -5486,7 +5733,6 @@ export {
   runDirectCompletionWithRetry,
   selectDirectAccount,
   setMetadataCache,
-  summarizeCodeBuddyLoginResponse,
   summarizeCursorAuth,
   summarizeDirectAccount,
   runDirectCompletion,

@@ -41,6 +41,7 @@ export function buildAdminSharedStyles() {
       line-height: 1.6;
       -webkit-font-smoothing: antialiased;
     }
+    body.modal-open { overflow: hidden; }
     button, input, textarea, select { font: inherit; }
     button {
       min-height: 36px;
@@ -454,6 +455,51 @@ export function buildAdminSharedStyles() {
       white-space: pre-wrap;
       min-height: 96px;
     }
+    .login-link-modal {
+      position: fixed;
+      inset: 0;
+      z-index: 1000;
+      display: grid;
+      place-items: center;
+      padding: 24px;
+      background: rgba(17, 24, 39, 0.52);
+      backdrop-filter: blur(4px);
+    }
+    .login-link-modal__panel {
+      width: min(760px, 100%);
+      max-height: calc(100vh - 48px);
+      overflow: auto;
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: var(--radius-lg);
+      box-shadow: 0 18px 48px rgba(0,0,0,0.16);
+      padding: 20px;
+    }
+    .login-link-modal__head {
+      display: flex;
+      align-items: flex-start;
+      justify-content: space-between;
+      gap: 12px;
+      margin-bottom: 14px;
+    }
+    .login-link-modal__head h3 {
+      margin: 0 0 4px;
+      font-size: 16px;
+      color: var(--text);
+    }
+    .login-link-modal__head p,
+    .login-link-modal__note {
+      margin: 0;
+      color: var(--text-muted);
+      font-size: 12px;
+    }
+    .login-link-modal textarea {
+      min-height: 120px;
+      font-family: var(--font-mono);
+      line-height: 1.55;
+      word-break: break-all;
+    }
+    .login-link-modal .row { justify-content: flex-end; }
 
     /* === ENDPOINTS === */
     .endpoint-list { display: grid; gap: 6px; margin-top: 4px; }
@@ -854,6 +900,11 @@ export function buildAdminSharedStyles() {
       .login { padding: 28px 22px; }
       .toast-stack { top: 12px; right: 12px; left: 12px; }
       .toast-item { max-width: none; }
+      .login-link-modal { padding: 12px; align-items: end; }
+      .login-link-modal__panel { max-height: calc(100vh - 24px); padding: 16px; }
+      .login-link-modal__head { display: grid; }
+      .login-link-modal .row { justify-content: stretch; }
+      .login-link-modal .row button { flex: 1; }
     }
   `;
 }

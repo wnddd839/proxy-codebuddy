@@ -27,6 +27,7 @@ import {
   importDirectAccounts,
   invalidateDirectMetadataCaches,
   isDirectAdminAuthorized,
+  normalizeCodeBuddyCredentialImportRequest,
   normalizeDirectModel,
   normalizeApiPath,
   normalizePublicModelName,
@@ -36,9 +37,6 @@ import {
   runDirectCompletionWithRetry,
   selectDirectAccount,
   setMetadataCache,
-  normalizeCodeBuddyLoginStatus,
-  parseCodeBuddyOAuthCallbackUrl,
-  summarizeCodeBuddyLoginResponse,
   summarizeCursorAuth,
   summarizeDirectAccount,
   writeCursorClientResponses,
@@ -857,6 +855,11 @@ test("nginx configs send legacy admin entrypoints to the direct admin console", 
     assert.match(nginx, /location = \/admin\/ \{\s*return 301 \/direct-admin\/;\s*\}/);
     assert.match(nginx, /location = \/admin-preview \{\s*return 301 \/direct-admin\/;\s*\}/);
     assert.match(nginx, /location = \/admin-preview\/ \{\s*return 301 \/direct-admin\/;\s*\}/);
+    assert.match(nginx, /location = \/codebuddy \{\s*return 301 \/codebuddy\/;\s*\}/);
+    assert.match(nginx, /location \^~ \/ws\/ \{/);
+    assert.match(nginx, /codebuddy\//);
+    assert.match(nginx, /api\/v1/);
+    assert.match(nginx, /assets/);
     assert.doesNotMatch(nginx, /proxy_pass http:\/\/127\.0\.0\.1:32125/);
   }
 });
@@ -878,77 +881,58 @@ test("deployment examples expose direct gateway streaming cache and parse knobs"
   }
 });
 
-test("CodeBuddy OAuth login response ignores daemon base URLs", () => {
-  assert.equal(
-    summarizeCodeBuddyLoginResponse({
-      ok: true,
-      baseUrl: "http://127.0.0.1:8080",
-      data: { status: "waiting" },
-    }).url,
-    "",
-  );
+test("CodeBuddy import route normalizes apiKey-only credentials", () => {
+  const source = readFileSync(new URL("../../cursor-direct-gateway.mjs", import.meta.url), "utf8");
+  const normalizer = source.match(/function normalizeCodeBuddyCredentialImportRequest\([^]*?^}/m)?.[0] || "";
+  const accountFactory = source.match(/function createCodeBuddyAccountFromCredential\([^]*?^}/m)?.[0] || "";
+  const collector = source.match(/function collectCodeBuddyCredentialFields\([^]*?^}/m)?.[0] || "";
+  const parser = source.match(/function parseCodeBuddyCredentialEnvText\([^]*?^}/m)?.[0] || "";
 
-  assert.equal(
-    summarizeCodeBuddyLoginResponse({
-      ok: true,
-      data: { authUrl: "https://codebuddy.example.com/oauth/login?state=abc" },
-    }).url,
-    "https://codebuddy.example.com/oauth/login?state=abc",
-  );
+  assert.ok(normalizer);
+  assert.ok(accountFactory);
+  assert.ok(collector);
+  assert.ok(parser);
+  assert.match(source, /\/direct-admin\/api\/codebuddy\/accounts\/import/);
+  assert.match(normalizer, /apiKey/);
+  assert.match(normalizer, /source\.(?:site|codeBuddySite|codebuddy_site)/);
+  assert.match(accountFactory, /site/);
+  assert.match(collector, /apikey/);
+  assert.match(parser, /CODEBUDDY_API_KEY/);
+  assert.doesNotMatch(normalizer, /authToken|refreshToken|apiKeyHelper|cookie|parseCodeBuddyGatewayCredentialInput/);
+  assert.doesNotMatch(collector, /authtoken|refreshtoken|cookieheader|apikeyhelper|credentialhelper/);
+  assert.doesNotMatch(parser, /CODEBUDDY_AUTH_TOKEN|CODEBUDDY_REFRESH_TOKEN|curlCookieHeader|looksLikeCookieHeader/);
 });
 
-test("CodeBuddy daemon auth status does not imply OAuth completion when auth is disabled", () => {
-  const status = normalizeCodeBuddyLoginStatus({
-    authEnabled: false,
-    authenticated: true,
+test("CodeBuddy apiKey import keeps the selected cloud site", () => {
+  const domestic = normalizeCodeBuddyCredentialImportRequest({
+    label: "CN Key",
+    site: "domestic",
+    apiKey: "ck-domestic-secret",
   });
+  assert.equal(domestic.accounts.length, 1);
+  assert.equal(domestic.accounts[0].site, "domestic");
+  assert.equal(domestic.accounts[0].baseUrl, "https://www.codebuddy.cn");
 
-  assert.equal(status.authEnabled, false);
-  assert.equal(status.authenticated, false);
-  assert.equal(status.loggedIn, false);
-  assert.equal(status.accessAllowed, true);
+  const global = normalizeCodeBuddyCredentialImportRequest({
+    label: "Global Key",
+    site: "global",
+    apiKey: "ck-global-secret",
+  });
+  assert.equal(global.accounts.length, 1);
+  assert.equal(global.accounts[0].site, "global");
+  assert.equal(global.accounts[0].baseUrl, "https://www.codebuddy.ai");
 });
 
-test("CodeBuddy OAuth callback URLs must match the pending session token", () => {
-  assert.deepEqual(
-    parseCodeBuddyOAuthCallbackUrl(
-      "https://proxy.example.com/direct-admin/codebuddy/oauth/callback?id=s1&token=t1",
-      { id: "s1", token: "t1" },
-    ),
-    { ok: true, id: "s1", token: "t1" },
-  );
-
-  assert.equal(
-    parseCodeBuddyOAuthCallbackUrl(
-      "/direct-admin/codebuddy/oauth/callback?id=s1&token=wrong",
-      { id: "s1", token: "t1" },
-    ).ok,
-    false,
-  );
-});
-
-test("CodeBuddy OAuth session does not publish daemon base URL as OAuth URL", () => {
+test("CodeBuddy legacy OAuth helpers instruct apiKey import only", () => {
   const source = readFileSync(new URL("../../cursor-direct-gateway.mjs", import.meta.url), "utf8");
+  const startSource = source.match(/async function startCodeBuddyOAuthSession\([^]*?^}/m)?.[0] || "";
+  const launchSource = source.match(/async function handleCodeBuddyOAuthLaunch\([^]*?^}/m)?.[0] || "";
 
-  assert.doesNotMatch(source, /url:\s*codeBuddyOAuthSession\.url\s*\|\|\s*normalizeCodeBuddyBaseUrl/);
-  assert.doesNotMatch(source, /codeBuddyOAuthSession\.url\s*=\s*normalizeCodeBuddyBaseUrl/);
-});
-
-test("CodeBuddy OAuth launch URL is registered as a public gateway route", () => {
-  const source = readFileSync(new URL("../../cursor-direct-gateway.mjs", import.meta.url), "utf8");
-
-  assert.match(
-    source,
-    /routePath\s*===\s*"\/direct-admin\/codebuddy\/oauth\/launch"[\s\S]{0,240}handleCodeBuddyOAuthLaunch\(req,\s*res,\s*url\)/,
-  );
-});
-
-test("CodeBuddy OAuth uses a callback-confirmed remote UI flow", () => {
-  const source = readFileSync(new URL("../../cursor-direct-gateway.mjs", import.meta.url), "utf8");
-
-  assert.match(source, /routePath\s*===\s*"\/direct-admin\/codebuddy\/oauth\/callback"/);
-  assert.match(source, /routePath\s*===\s*"\/codebuddy"/);
-  assert.match(source, /routePath\.startsWith\("\/api\/v1\/"\)/);
-  assert.match(source, /handleCodeBuddyRemoteProxy\(req,\s*res,\s*url\)/);
-  assert.match(source, /codeBuddyOAuthSession\.confirmedAt/);
+  assert.ok(startSource);
+  assert.ok(launchSource);
+  assert.doesNotMatch(source, /@tencent-ai\/agent-sdk/);
+  assert.doesNotMatch(source, /unstable_v2_authenticate/);
+  assert.match(startSource, /API Key/);
+  assert.match(launchSource, /API Key/);
+  assert.doesNotMatch(startSource, /cookie|helper/i);
 });

@@ -1,3 +1,5 @@
+import { randomUUID } from "node:crypto";
+
 import { createProviderTurnAccumulator } from "./provider-events.mjs";
 
 function normalizeBaseUrl(value) {
@@ -129,6 +131,31 @@ function normalizeCodeBuddyModels(input = {}) {
     .filter((row) => !allowed || allowed.has(row.id));
 }
 
+function buildCodeBuddyPromptText(messages = []) {
+  return Array.isArray(messages)
+    ? messages
+      .map((message) => {
+        const role = String(message?.role || "user").toUpperCase();
+        const content = extractTextContent(message?.content).trim();
+        return content ? `${role}: ${content}` : "";
+      })
+      .filter(Boolean)
+      .join("\n\n")
+    : "";
+}
+
+function normalizeOpenAiMessage(message = {}) {
+  const role = String(message?.role || "user").trim() || "user";
+  const content = extractTextContent(message?.content).trim();
+  return { role, content };
+}
+
+function normalizeOpenAiMessages(messages = []) {
+  return (Array.isArray(messages) ? messages : [])
+    .map(normalizeOpenAiMessage)
+    .filter((message) => message.content);
+}
+
 export function createCodeBuddyHeaders(options = {}) {
   const headers = {
     accept: "application/json",
@@ -149,27 +176,23 @@ export function createCodeBuddyHeaders(options = {}) {
 export function buildCodeBuddyRunRequest(messages = [], options = {}) {
   const baseHeaders = createCodeBuddyHeaders({
     token: options.token,
-    exemptRequestHeader: options.exemptRequestHeader,
+    exemptRequestHeader: true,
   });
+  const normalizedMessages = normalizeOpenAiMessages(messages);
   return {
     method: "POST",
-    url: `${normalizeBaseUrl(options.baseUrl)}/api/v1/runs`,
+    url: `${normalizeBaseUrl(options.baseUrl)}/v2/chat/completions`,
     headers: {
       ...baseHeaders,
       ...(options.headers && typeof options.headers === "object" ? options.headers : {}),
     },
     body: {
-      text: Array.isArray(messages)
-        ? messages
-          .map((message) => {
-            const role = String(message?.role || "user").toUpperCase();
-            const content = extractTextContent(message?.content).trim();
-            return content ? `${role}: ${content}` : "";
-          })
-          .filter(Boolean)
-          .join("\n\n")
-        : "",
-      sender: options.sender || { id: "cursor-proxy", name: "Cursor Proxy" },
+      model: options.model || "claude-sonnet-4.5",
+      messages: normalizedMessages.length > 0 ? normalizedMessages : [{ role: "user", content: "" }],
+      stream: Boolean(options.stream),
+      ...(options.maxTokens ? { max_tokens: Number(options.maxTokens) } : {}),
+      ...(options.tools ? { tools: options.tools } : {}),
+      ...(options.toolChoice ? { tool_choice: options.toolChoice } : {}),
     },
   };
 }
@@ -299,6 +322,29 @@ function mapOpenAiLikeDeltaToProviderEvents(payload = {}) {
   return events;
 }
 
+function mapOpenAiLikeMessageToProviderEvents(payload = {}) {
+  const choices = Array.isArray(payload.choices) ? payload.choices : [];
+  const message = choices[0]?.message || choices[0]?.delta || {};
+  const events = [];
+  const text = firstTextValue(message.content, message.text, payload.output_text);
+  if (text) events.push({ type: "text_delta", text, source: "codebuddy_openai" });
+
+  const toolCalls = Array.isArray(message.tool_calls) ? message.tool_calls : [];
+  for (const toolCall of toolCalls) {
+    events.push({
+      type: "tool_use",
+      id: typeof toolCall.id === "string" ? toolCall.id : `call_${Date.now()}`,
+      name: typeof toolCall.function?.name === "string" ? toolCall.function.name : "",
+      input: normalizeToolInput(toolCall.function?.arguments ?? {}),
+      source: "codebuddy_openai",
+    });
+  }
+
+  const finishReason = choices[0]?.finish_reason || choices[0]?.finishReason;
+  if (finishReason) events.push({ type: "turn_ended", stopReason: String(finishReason), source: "codebuddy_openai" });
+  return events;
+}
+
 export function mapCodeBuddySseEventToProviderEvents(sseEvent = {}) {
   const data = unwrapCodeBuddyPayload(sseEvent.data);
   if (!data || typeof data !== "object") {
@@ -383,6 +429,15 @@ async function readJsonResponse(response) {
   return parsed && typeof parsed === "object" ? parsed : {};
 }
 
+function getCodeBuddyErrorMessage(payload = {}, fallback = "CodeBuddy upstream error") {
+  if (payload?.error && typeof payload.error === "object") {
+    return String(payload.error.message || payload.error.code || fallback);
+  }
+  if (typeof payload?.error === "string") return payload.error;
+  if (typeof payload?.message === "string") return payload.message;
+  return fallback;
+}
+
 function extractCodeBuddyRunId(payload = {}) {
   const root = unwrapCodeBuddyPayload(payload);
   return String(
@@ -456,41 +511,54 @@ export async function runCodeBuddyCompletion(messages = [], options = {}) {
   const fetchImpl = options.fetchImpl || globalThis.fetch;
   if (typeof fetchImpl !== "function") throw new Error("fetch is not available for CodeBuddy provider");
 
-  const request = buildCodeBuddyRunRequest(messages, options);
+  const stream = Boolean(options.stream ?? options.onDelta);
+  const started = Date.now();
+  const request = buildCodeBuddyRunRequest(messages, { ...options, stream });
   const runResponse = await fetchImpl(request.url, {
     method: request.method,
     headers: request.headers,
-    body: JSON.stringify({
-      ...request.body,
-      ...(options.model ? { model: options.model } : {}),
-      ...(options.tools ? { tools: options.tools } : {}),
-      ...(options.toolChoice ? { tool_choice: options.toolChoice } : {}),
-    }),
+    body: JSON.stringify(request.body),
     signal: options.signal,
   });
 
   if (!runResponse.ok) {
-    throw new Error(`CodeBuddy run failed with ${runResponse.status}: ${(await readResponseText(runResponse)).slice(0, 300)}`);
+    const errorText = await readResponseText(runResponse);
+    let errorPayload = {};
+    try {
+      errorPayload = errorText ? JSON.parse(errorText) : {};
+    } catch {
+      errorPayload = {};
+    }
+    throw new Error(`CodeBuddy chat completion failed with ${runResponse.status}: ${getCodeBuddyErrorMessage(errorPayload, errorText).slice(0, 300)}`);
   }
 
-  const runPayload = await readJsonResponse(runResponse);
-  const runId = extractCodeBuddyRunId(runPayload);
-  if (!runId) throw new Error("CodeBuddy run response did not include runId");
-  const streamUrl = extractCodeBuddyStreamUrl(runPayload, options)
-    || `${normalizeBaseUrl(options.baseUrl)}/api/v1/runs/${encodeURIComponent(runId)}/stream`;
-
-  const streamResponse = await fetchImpl(streamUrl, {
-    method: "GET",
-    headers: request.headers,
-    signal: options.signal,
-  });
-
-  if (!streamResponse.ok) {
-    throw new Error(`CodeBuddy stream failed with ${streamResponse.status}: ${(await readResponseText(streamResponse)).slice(0, 300)}`);
+  if (!stream) {
+    const payload = await readJsonResponse(runResponse);
+    const accumulator = createProviderTurnAccumulator();
+    let eventCount = 0;
+    let deltaCount = 0;
+    for (const event of mapOpenAiLikeMessageToProviderEvents(payload)) {
+      eventCount += 1;
+      accumulator.push(event);
+      options.onEvent?.(event);
+      if (event.type === "text_delta") {
+        deltaCount += 1;
+        options.onDelta?.(event.text ?? "");
+      }
+    }
+    return {
+      turn: accumulator.snapshot({ prompt: JSON.stringify(request.body.messages) }),
+      durationMs: Date.now() - started,
+      bytes: 0,
+      eventCount,
+      deltaCount,
+      status: runResponse.status,
+      model: request.body.model,
+    };
   }
 
-  const streamResult = await readCodeBuddyStreamResponse(streamResponse, {
-    prompt: request.body.text,
+  const streamResult = await readCodeBuddyStreamResponse(runResponse, {
+    prompt: JSON.stringify(request.body.messages),
     onDelta: options.onDelta,
     onEvent: options.onEvent,
   });
@@ -499,9 +567,8 @@ export async function runCodeBuddyCompletion(messages = [], options = {}) {
   }
   return {
     ...streamResult,
-    runId,
     status: runResponse.status,
-    model: options.model || "default",
+    model: request.body.model,
   };
 }
 
