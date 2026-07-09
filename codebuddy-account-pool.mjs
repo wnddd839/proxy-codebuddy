@@ -1,14 +1,18 @@
-import { spawn } from "node:child_process";
 import { createHash } from "node:crypto";
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import path from "node:path";
 
-import { createCodeBuddyHeaders, normalizeBaseUrl } from "./codebuddy-provider.mjs";
+import { buildCodeBuddyDaemonHeaders, getCodeBuddyDaemonConfig } from "./codebuddy-cli-daemon.mjs";
+import { decodeCodeBuddyJwtPayload } from "./codebuddy-oauth.mjs";
+import { buildCodeBuddyCloudHeaders, buildCodeBuddyProtocolDirectHeaders, normalizeBaseUrl } from "./codebuddy-provider.mjs";
 
 const DEFAULT_CODEBUDDY_ACCOUNTS_PATH = path.join(homedir(), ".codebuddy", "proxy-accounts.json");
-const DEFAULT_HELPER_TIMEOUT_MS = 10000;
-const MAX_HELPER_OUTPUT_BYTES = 64 * 1024;
+const DEFAULT_CODEBUDDY_TRANSPORT = "protocol_direct";
+const CODEBUDDY_SITE_CONFIG = {
+  domestic: { site: "domestic", baseUrl: "https://www.codebuddy.cn", internetEnvironment: "domestic" },
+  global: { site: "global", baseUrl: "https://www.codebuddy.ai", internetEnvironment: "public" },
+};
 
 function maskSecret(value, visible = 5) {
   const text = String(value || "");
@@ -30,6 +34,27 @@ function compactString(value) {
   return String(value || "").trim();
 }
 
+function normalizeCodeBuddyApiEndpoint(value) {
+  const text = compactString(value);
+  if (!text) return "";
+  try {
+    return new URL(text).toString().replace(/\/+$/, "");
+  } catch {
+    return text.replace(/\/+$/, "");
+  }
+}
+
+function looksLikeCodeBuddySecretValue(value) {
+  const text = compactString(value).replace(/^['"]|['"]$/g, "");
+  if (!text) return false;
+  if (/^\d{10,}$/.test(text)) return false;
+  if (/^[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}$/i.test(text)) return false;
+  if (text.length < 16) return false;
+  if (/^eyJ[A-Za-z0-9_-]*\./.test(text)) return true;
+  if (/[A-Za-z]/.test(text) && /[A-Za-z0-9]/.test(text)) return true;
+  return false;
+}
+
 function normalizeAuthStatus(value) {
   const source = value && typeof value === "object" ? value : {};
   const loggedIn = typeof source.loggedIn === "boolean"
@@ -49,36 +74,74 @@ function normalizeAuthStatus(value) {
 
 function normalizeCodeBuddyAccountAuth(input) {
   const source = input && typeof input === "object" ? input : {};
+  const bearerToken = compactString(
+    source.bearerToken ||
+    source.bearer_token ||
+    source.accessToken ||
+    source.access_token ||
+    "",
+  );
+  const apiKey = compactString(
+    source.apiKey || source.api_key || source.xApiKey || source.x_api_key || source["x-api-key"] || "",
+  );
+  const genericKey = compactString(source.key || "");
   return {
-    authToken: compactString(source.authToken || source.auth_token || source.token || source.accessToken || ""),
-    apiKey: compactString(source.apiKey || source.api_key || source.key || ""),
-    apiKeyHelper: compactString(source.apiKeyHelper || source.api_key_helper || source.helper || ""),
+    apiKey: apiKey || (/^ck[_-]/i.test(genericKey) ? genericKey : ""),
+    bearerToken: bearerToken || (genericKey.startsWith("eyJ") ? genericKey : ""),
+    refreshToken: compactString(source.refreshToken || source.refresh_token || ""),
+    tokenExpiresAt: Number(source.tokenExpiresAt || source.token_expires_at || 0),
+    createdAtSec: Number(source.created_at || source.createdAt || 0),
+    expiresInSec: Number(source.expires_in || source.expiresIn || 0),
   };
 }
 
-function getCredentialHash(auth) {
-  return hashSecret(auth.authToken || auth.apiKey || auth.apiKeyHelper || "");
+function resolveTokenExpiresAt(auth, source = {}) {
+  if (auth.tokenExpiresAt > 0) return auth.tokenExpiresAt;
+  const created = Number(source.created_at || source.createdAt || auth.createdAtSec || 0);
+  const expiresIn = Number(source.expires_in || source.expiresIn || auth.expiresInSec || 0);
+  if (!created || !expiresIn) return 0;
+  const createdMs = created < 1e12 ? created * 1000 : created;
+  return createdMs + expiresIn * 1000;
 }
 
-function isDaemonAuthType(value) {
-  return ["daemon", "daemon_oauth", "oauth", "codebuddy_daemon"].includes(compactString(value).toLowerCase());
+function getCredentialHash(auth) {
+  return hashSecret(auth.bearerToken || auth.apiKey || "");
 }
 
 function getAuthType(auth) {
-  if (auth.authToken) return "auth_token";
-  if (auth.apiKeyHelper) return "api_key_helper";
+  if (auth.bearerToken) return "bearer";
   if (auth.apiKey) return "api_key";
   return "";
 }
 
+function normalizeCodeBuddySite(value) {
+  const text = compactString(value).toLowerCase();
+  if (["domestic", "cn", "china", "internal"].includes(text)) return "domestic";
+  return "global";
+}
+
+function inferCodeBuddySite(source = {}) {
+  if (source.site || source.codeBuddySite || source.codebuddy_site) {
+    return normalizeCodeBuddySite(source.site || source.codeBuddySite || source.codebuddy_site);
+  }
+  const env = compactString(source.internetEnvironment || source.internet_environment || "").toLowerCase();
+  if (env === "internal") return "domestic";
+  const url = compactString(source.baseUrl || source.url || "").toLowerCase();
+  if (url.includes("codebuddy.cn") || url.includes("copilot.tencent.com")) return "domestic";
+  return "global";
+}
+
+function normalizeCodeBuddyTransport(value) {
+  const text = compactString(value).toLowerCase();
+  if (!text) return DEFAULT_CODEBUDDY_TRANSPORT;
+  if (["protocol_direct", "protocol-direct", "direct", "cloud_direct", "cloud-direct"].includes(text)) return "protocol_direct";
+  if (text === "cloud") return "cloud";
+  if (["cli_daemon", "cli-daemon", "daemon"].includes(text)) return "cli_daemon";
+  return DEFAULT_CODEBUDDY_TRANSPORT;
+}
+
 function hasCodeBuddyCredentials(account) {
-  return Boolean(
-    account?.authToken ||
-    account?.apiKeyHelper ||
-    account?.apiKey ||
-    isDaemonAuthType(account?.authType) ||
-    account?.useDaemonAuth === true,
-  );
+  return Boolean(compactString(account?.apiKey || account?.bearerToken || ""));
 }
 
 function getCodeBuddyAccountsPath(options = {}) {
@@ -121,18 +184,61 @@ export function createCodeBuddyAccount(raw = {}, options = {}) {
   const source = raw && typeof raw === "object" ? raw : {};
   const now = Number(options.now || Date.now());
   const auth = normalizeCodeBuddyAccountAuth(source);
-  const authStatus = normalizeAuthStatus(source.authStatus || source.status || {});
-  const daemonAuth = source.useDaemonAuth === true ||
-    isDaemonAuthType(source.authType || source.auth_type || source.authMode || authStatus.authMode);
-  const baseUrl = normalizeBaseUrl(source.baseUrl || source.url || "");
-  const credentialHash = source.credentialHash || (daemonAuth
-    ? hashSecret(`daemon|${baseUrl}|${source.internetEnvironment || source.internet_environment || ""}`)
-    : getCredentialHash(auth));
+  const authStatus = normalizeAuthStatus({
+    ...(source.authStatus || source.status || {}),
+    userId: compactString(
+      source.authStatus?.userId ||
+      source.authStatus?.user_id ||
+      source.user_id ||
+      source.userId ||
+      "",
+    ),
+    userName: compactString(
+      source.authStatus?.userName ||
+      source.authStatus?.user_name ||
+      source.user_info?.name ||
+      source.user_info?.email ||
+      source.user_name ||
+      "",
+    ),
+    userNickname: compactString(source.authStatus?.userNickname || source.user_info?.nickname || ""),
+    authMode: compactString(source.authStatus?.authMode || source.auth_mode || ""),
+    loggedIn: source.authStatus?.loggedIn !== false,
+    authenticated: source.authStatus?.authenticated !== false,
+  });
+  const site = inferCodeBuddySite(source);
+  const siteConfig = CODEBUDDY_SITE_CONFIG[site] || CODEBUDDY_SITE_CONFIG.global;
+  const baseUrl = normalizeBaseUrl(source.baseUrl || source.url || siteConfig.baseUrl);
+  const internetEnvironment = compactString(source.internetEnvironment || source.internet_environment || siteConfig.internetEnvironment);
+  const apiEndpoint = normalizeCodeBuddyApiEndpoint(
+    source.apiEndpoint || source.api_endpoint || source.chatEndpoint || source.endpoint || "",
+  );
+  const chatCompletionsPath = compactString(
+    source.chatCompletionsPath || source.chat_completions_path || source.endpointPath || source.endpoint_path || "",
+  );
+  const domain = compactString(source.domain || source.xDomain || source["x-domain"] || "");
+  const enterpriseId = compactString(source.enterpriseId || source.enterprise_id || source.tenantId || source.tenant_id || "");
+  const tenantId = compactString(source.tenantId || source.tenant_id || enterpriseId || "");
+  const departmentFullName = compactString(source.departmentFullName || source.department_full_name || source.departmentInfo || source.department_info || "");
+  const inferredTransport = source.useDaemonAuth === true
+    ? "cli_daemon"
+    : auth.bearerToken
+      ? DEFAULT_CODEBUDDY_TRANSPORT
+      : auth.apiKey
+        ? "cloud"
+        : "cli_daemon";
+  const transport = normalizeCodeBuddyTransport(
+    source.transport || source.codeBuddyTransport || process.env.CURSOR_DIRECT_CODEBUDDY_TRANSPORT || inferredTransport,
+  );
+  const daemonBaseUrl = normalizeBaseUrl(
+    source.daemonBaseUrl || source.daemon_base_url || source.serveUrl || source.serve_url || getCodeBuddyDaemonConfig().serveUrl,
+  );
+  const credentialHash = source.credentialHash || getCredentialHash(auth) || hashSecret(`${transport}|${daemonBaseUrl}`);
   const identity = authStatus.userId || authStatus.userName || source.subject || source.email || source.label || "";
   const id = compactString(
     options.id ||
     source.id ||
-    hashSecret(`${identity}|${credentialHash}|${baseUrl}|${source.internetEnvironment || ""}`),
+    hashSecret(`${identity}|${credentialHash}|${baseUrl}|${internetEnvironment}|${site}|${apiEndpoint}|${chatCompletionsPath}`),
   );
   const createdAt = Number(source.createdAt || (options.preserveTimestamps ? now : 0) || now);
   const updatedAt = Number(source.updatedAt || now);
@@ -143,13 +249,23 @@ export function createCodeBuddyAccount(raw = {}, options = {}) {
     label: compactString(source.label || authStatus.userName || authStatus.userId || `CodeBuddy ${id.slice(0, 6)}`),
     enabled: source.enabled !== false && options.enabled !== false,
     source: compactString(options.source || source.source || "pool"),
+    site,
     baseUrl,
-    internetEnvironment: compactString(source.internetEnvironment || source.internet_environment || ""),
-    authType: daemonAuth ? "daemon" : getAuthType(auth),
-    useDaemonAuth: daemonAuth,
-    authToken: auth.authToken,
+    internetEnvironment,
+    apiEndpoint,
+    chatCompletionsPath,
+    domain,
+    enterpriseId,
+    tenantId,
+    departmentFullName,
+    transport,
+    daemonBaseUrl,
+    authType: getAuthType(auth),
+    useDaemonAuth: transport === "cli_daemon",
     apiKey: auth.apiKey,
-    apiKeyHelper: auth.apiKeyHelper,
+    bearerToken: auth.bearerToken,
+    refreshToken: auth.refreshToken,
+    tokenExpiresAt: resolveTokenExpiresAt(auth, source),
     credentialHash,
     authStatus,
     createdAt,
@@ -166,17 +282,31 @@ export function normalizeCodeBuddyAccountsStore(store) {
   const input = store && typeof store === "object" ? store : createEmptyCodeBuddyAccountsStore();
   const accounts = (Array.isArray(input.accounts) ? input.accounts : [])
     .map(normalizeStoredCodeBuddyAccount)
-    .filter(Boolean);
+    .filter(Boolean)
+    .filter(hasCodeBuddyCredentials);
   const rawNext = Number.isInteger(input.nextIndex) ? input.nextIndex : 0;
   const nextIndex = accounts.length > 0 ? ((rawNext % accounts.length) + accounts.length) % accounts.length : 0;
   return { version: 1, provider: "codebuddy", nextIndex, accounts };
 }
 
+function isCodeBuddyAccountEligible(account, options = {}) {
+  if (!account || account.enabled === false || !hasCodeBuddyCredentials(account)) return false;
+  const preferredSite = compactString(options.site || options.codeBuddySite || "");
+  if (preferredSite) {
+    const accountSite = account.site || inferCodeBuddySite(account);
+    if (normalizeCodeBuddySite(accountSite) !== normalizeCodeBuddySite(preferredSite)) return false;
+  }
+  const excludeAccountIds = Array.isArray(options.excludeAccountIds) ? options.excludeAccountIds : [];
+  if (excludeAccountIds.includes(account.id)) return false;
+  return true;
+}
+
 export function summarizeCodeBuddyAccount(account) {
   const authStatus = normalizeAuthStatus(account?.authStatus || {});
-  const loggedIn = typeof authStatus.loggedIn === "boolean"
-    ? authStatus.loggedIn
-    : hasCodeBuddyCredentials(account);
+  const hasCreds = hasCodeBuddyCredentials(account);
+  const loggedIn = hasCreds
+    ? (typeof authStatus.loggedIn === "boolean" ? authStatus.loggedIn : true)
+    : (typeof authStatus.loggedIn === "boolean" ? authStatus.loggedIn : false);
   const authType = account?.authType || getAuthType(normalizeCodeBuddyAccountAuth(account));
   return {
     id: account?.id || "",
@@ -184,8 +314,17 @@ export function summarizeCodeBuddyAccount(account) {
     label: account?.label || "",
     enabled: account?.enabled !== false,
     source: account?.source || "pool",
+    site: account?.site || inferCodeBuddySite(account || {}),
     baseUrl: account?.baseUrl || "",
     internetEnvironment: account?.internetEnvironment || "",
+    apiEndpoint: account?.apiEndpoint || "",
+    chatCompletionsPath: account?.chatCompletionsPath || "",
+    domain: account?.domain || "",
+    enterpriseId: account?.enterpriseId || "",
+    tenantId: account?.tenantId || "",
+    departmentFullName: account?.departmentFullName || "",
+    transport: account?.transport || "cli_daemon",
+    daemonBaseUrl: account?.daemonBaseUrl || "",
     authType,
     hasCredentials: hasCodeBuddyCredentials(account),
     loggedIn,
@@ -193,9 +332,12 @@ export function summarizeCodeBuddyAccount(account) {
     userName: authStatus.userName,
     userNickname: authStatus.userNickname,
     authMode: authStatus.authMode,
-    authTokenPreview: maskSecret(account?.authToken, 6),
+    authTokenPreview: "",
+    bearerTokenPreview: hasCodeBuddyCredentials(account) ? maskSecret(account?.bearerToken, 6) : "",
+    refreshTokenPreview: hasCodeBuddyCredentials(account) ? maskSecret(account?.refreshToken, 4) : "",
     apiKeyPreview: maskSecret(account?.apiKey, 6),
-    apiKeyHelperPreview: maskSecret(account?.apiKeyHelper, 6),
+    apiKeyHelperPreview: "",
+    cookiePreview: "",
     createdAt: Number(account?.createdAt || 0),
     updatedAt: Number(account?.updatedAt || 0),
     lastUsedAt: Number(account?.lastUsedAt || 0),
@@ -203,6 +345,8 @@ export function summarizeCodeBuddyAccount(account) {
     successRequests: Number(account?.successRequests || 0),
     failedRequests: Number(account?.failedRequests || 0),
     lastError: compactString(account?.lastError || ""),
+    tokenExpiresAt: Number(account?.tokenExpiresAt || 0),
+    tokenExpired: Number(account?.tokenExpiresAt || 0) > 0 && Number(account?.tokenExpiresAt || 0) <= Date.now(),
   };
 }
 
@@ -220,7 +364,9 @@ export function summarizeCodeBuddyAccountsStore(store, options = {}) {
     count: accounts.length,
     enabledCount: enabledAccounts.length,
     disabledCount: accounts.length - enabledAccounts.length,
-    loggedIn: Boolean(primary?.loggedIn),
+    loggedIn: Boolean(
+      enabledAccounts.some((account) => account.hasCredentials && account.loggedIn !== false),
+    ),
     primary,
     accounts,
   };
@@ -233,6 +379,7 @@ export function importCodeBuddyAccounts(store, input, options = {}) {
 
   for (const raw of parseCodeBuddyAccountsImportInput(input)) {
     const account = createCodeBuddyAccount(raw, { now });
+    if (!hasCodeBuddyCredentials(account)) continue;
     const existingIndex = nextStore.accounts.findIndex((item) => (
       item.id === account.id ||
       (account.credentialHash && item.credentialHash === account.credentialHash) ||
@@ -276,6 +423,15 @@ export function selectCodeBuddyAccount(store, options = {}) {
     const selected = normalized.accounts[selectedIndex];
     if (selected.enabled === false) throw new Error(`CodeBuddy account is disabled: ${accountId}`);
     if (!hasCodeBuddyCredentials(selected)) throw new Error(`CodeBuddy account has no credentials: ${accountId}`);
+    const preferredSite = compactString(options.site || options.codeBuddySite || "");
+    if (preferredSite) {
+      const accountSite = selected.site || inferCodeBuddySite(selected);
+      if (normalizeCodeBuddySite(accountSite) !== normalizeCodeBuddySite(preferredSite)) {
+        throw new Error(
+          `CodeBuddy account site mismatch: account=${accountSite}, configured=${normalizeCodeBuddySite(preferredSite)}`,
+        );
+      }
+    }
     const accounts = normalized.accounts.slice();
     accounts[selectedIndex] = { ...selected, lastSelectedAt: now };
     return {
@@ -289,7 +445,7 @@ export function selectCodeBuddyAccount(store, options = {}) {
   for (let offset = 0; offset < normalized.accounts.length; offset += 1) {
     const selectedIndex = (normalized.nextIndex + offset) % normalized.accounts.length;
     const selected = normalized.accounts[selectedIndex];
-    if (!selected || selected.enabled === false || !hasCodeBuddyCredentials(selected)) continue;
+    if (!isCodeBuddyAccountEligible(selected, options)) continue;
     const accounts = normalized.accounts.slice();
     accounts[selectedIndex] = { ...selected, lastSelectedAt: now };
     return {
@@ -304,18 +460,42 @@ export function selectCodeBuddyAccount(store, options = {}) {
     };
   }
 
-  throw new Error("No enabled CodeBuddy accounts with credentials available");
+  throw new Error(
+    compactString(options.site || options.codeBuddySite || "")
+      ? `No enabled CodeBuddy accounts with credentials available for site=${normalizeCodeBuddySite(options.site || options.codeBuddySite)}`
+      : "No enabled CodeBuddy accounts with credentials available",
+  );
 }
 
 export function readCodeBuddyAccountsStore(options = {}) {
   const accountsPath = getCodeBuddyAccountsPath(options);
   if (!existsSync(accountsPath)) return createEmptyCodeBuddyAccountsStore();
-  return normalizeCodeBuddyAccountsStore(JSON.parse(readFileSync(accountsPath, "utf8")));
+  const raw = normalizeCodeBuddyAccountsStore(JSON.parse(readFileSync(accountsPath, "utf8")));
+  const parsed = JSON.parse(readFileSync(accountsPath, "utf8"));
+  const before = Array.isArray(parsed.accounts) ? parsed.accounts.length : 0;
+  if (before !== raw.accounts.length) {
+    writeCodeBuddyAccountsStore(raw, { accountsPath });
+  }
+  return raw;
 }
 
 export function writeCodeBuddyAccountsStore(store, options = {}) {
   const accountsPath = getCodeBuddyAccountsPath(options);
   const normalized = normalizeCodeBuddyAccountsStore(store);
+  const allowShrink = options.allowShrink === true;
+  if (!allowShrink && existsSync(accountsPath)) {
+    try {
+      const existing = normalizeCodeBuddyAccountsStore(JSON.parse(readFileSync(accountsPath, "utf8")));
+      if (existing.accounts.length > 0 && normalized.accounts.length < existing.accounts.length) {
+        throw new Error(
+          `Refusing to shrink CodeBuddy accounts store from ${existing.accounts.length} to ${normalized.accounts.length} at ${accountsPath}`,
+        );
+      }
+    } catch (error) {
+      if (/Refusing to shrink CodeBuddy accounts store/.test(String(error?.message || error))) throw error;
+      // Corrupt/unreadable existing file: allow overwrite with normalized store.
+    }
+  }
   mkdirSync(path.dirname(accountsPath), { recursive: true });
   writeFileSync(accountsPath, `${JSON.stringify(normalized, null, 2)}\n`, { mode: 0o600 });
   return normalized;
@@ -338,98 +518,52 @@ export function markCodeBuddyAccountResult(selection, ok, options = {}) {
   writeCodeBuddyAccountsStore({ ...store, accounts }, { accountsPath });
 }
 
-function runApiKeyHelper(command, options = {}) {
-  return new Promise((resolve, reject) => {
-    const timeoutMs = Math.max(1000, Number(options.timeoutMs || DEFAULT_HELPER_TIMEOUT_MS));
-    const child = spawn(command, {
-      shell: true,
-      stdio: ["ignore", "pipe", "pipe"],
-      env: { ...process.env, ...(options.env || {}) },
-      windowsHide: true,
-    });
-
-    let stdout = "";
-    let stderr = "";
-    const timer = setTimeout(() => {
-      try {
-        child.kill("SIGTERM");
-      } catch {
-        // ignore
-      }
-      reject(new Error("CodeBuddy apiKeyHelper timed out"));
-    }, timeoutMs);
-
-    child.stdout.on("data", (chunk) => {
-      stdout += Buffer.from(chunk).toString("utf8");
-      if (Buffer.byteLength(stdout, "utf8") > MAX_HELPER_OUTPUT_BYTES) {
-        try {
-          child.kill("SIGTERM");
-        } catch {
-          // ignore
-        }
-        reject(new Error("CodeBuddy apiKeyHelper output exceeded limit"));
-      }
-    });
-    child.stderr.on("data", (chunk) => {
-      stderr += Buffer.from(chunk).toString("utf8");
-    });
-    child.on("error", (error) => {
-      clearTimeout(timer);
-      reject(error);
-    });
-    child.on("close", (code) => {
-      clearTimeout(timer);
-      if (code !== 0) {
-        reject(new Error(`CodeBuddy apiKeyHelper exited with code ${String(code)}: ${stderr.trim().slice(0, 300)}`));
-        return;
-      }
-      resolve(stdout);
-    });
-  });
-}
-
-function firstNonEmptyLine(text) {
-  return String(text || "").split(/\r?\n/).map((line) => line.trim()).find(Boolean) || "";
-}
-
 export async function resolveCodeBuddyAccountHeaders(account, options = {}) {
   const normalized = createCodeBuddyAccount(account || {});
-  const baseHeaders = createCodeBuddyHeaders({
-    exemptRequestHeader: options.exemptRequestHeader,
-  });
 
-  if (normalized.authToken) {
-    return {
-      ...baseHeaders,
-      authorization: `Bearer ${normalized.authToken}`,
-    };
+  if (normalized.transport === "cli_daemon") {
+    return buildCodeBuddyDaemonHeaders({
+      gatewayPassword: options.gatewayPassword || getCodeBuddyDaemonConfig().gatewayPassword,
+    });
   }
 
-  if (normalized.apiKeyHelper) {
-    const helperRunner = options.helperRunner || runApiKeyHelper;
-    const value = firstNonEmptyLine(await helperRunner(normalized.apiKeyHelper, {
-      account: normalized,
-      timeoutMs: options.helperTimeoutMs,
-      env: options.env,
-    }));
-    if (!value) throw new Error("CodeBuddy apiKeyHelper returned empty credentials");
-    return {
-      ...baseHeaders,
-      "x-api-key": value,
-      authorization: `Bearer ${value}`,
-    };
+  if (normalized.transport === "protocol_direct") {
+    if (!normalized.bearerToken) {
+      throw new Error(`CodeBuddy protocol direct account has no OAuth bearer token: ${normalized.id}`);
+    }
+    return buildCodeBuddyProtocolDirectHeaders({
+      bearerToken: normalized.bearerToken,
+      baseUrl: normalized.baseUrl || options.baseUrl,
+      apiEndpoint: normalized.apiEndpoint || options.apiEndpoint,
+      chatCompletionsPath: normalized.chatCompletionsPath || options.chatCompletionsPath,
+      site: normalized.site || options.site,
+      internetEnvironment: normalized.internetEnvironment || options.internetEnvironment,
+      userId: normalized.authStatus?.userId || options.userId || "",
+      domain: normalized.domain || options.domain || "",
+      enterpriseId: normalized.enterpriseId || options.enterpriseId || "",
+      tenantId: normalized.tenantId || options.tenantId || "",
+      departmentFullName: normalized.departmentFullName || options.departmentFullName || "",
+    });
+  }
+
+  if (normalized.bearerToken) {
+    const jwt = decodeCodeBuddyJwtPayload(normalized.bearerToken);
+    const userId = String(
+      jwt.sub || jwt.email || jwt.preferred_username || normalized.authStatus?.userId || "anonymous",
+    ).trim();
+    return buildCodeBuddyCloudHeaders({
+      bearerToken: normalized.bearerToken,
+      baseUrl: normalized.baseUrl || options.baseUrl,
+      userId,
+    });
   }
 
   if (normalized.apiKey) {
-    return {
-      ...baseHeaders,
-      "x-api-key": normalized.apiKey,
-      authorization: `Bearer ${normalized.apiKey}`,
-    };
-  }
-
-  if (isDaemonAuthType(normalized.authType)) {
-    return baseHeaders;
+    return buildCodeBuddyCloudHeaders({
+      apiKey: normalized.apiKey,
+      baseUrl: normalized.baseUrl || options.baseUrl,
+      userId: "anonymous",
+    });
   }
 
   throw new Error(`CodeBuddy account has no credentials: ${normalized.id}`);
@@ -438,4 +572,5 @@ export async function resolveCodeBuddyAccountHeaders(account, options = {}) {
 export {
   createEmptyCodeBuddyAccountsStore,
   getCodeBuddyAccountsPath,
+  hasCodeBuddyCredentials,
 };

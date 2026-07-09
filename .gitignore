@@ -6,10 +6,20 @@ bun.lock
 .env
 .env.*
 !.env.example
+*.env
+!*.env.example
+cursor-direct-gateway.env
 data/
 auth.json
 direct-accounts.json
+codebuddy-accounts.json
 .codex-preview/
+.codex-backups/
+backup-*/
+backups/
+*.bak
+*.bak-*
+*.backup-*
 
 # Local agent config and work dirs
 .opencode/

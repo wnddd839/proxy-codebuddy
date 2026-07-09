@@ -1,42 +1,39 @@
 # Cursor Proxy
 
-Cursor Proxy 是一个面向自有 Cursor 账号的 OpenAI-compatible 代理网关，目标是把 Cursor 账号池、API 转发、管理台和 NewAPI 接入整理成一个轻量、好部署、好维护的项目。
+OpenAI 兼容网关：把 **Cursor Direct** 与 **CodeBuddy 协议直连** 收成一套可自建的 `/v1` 服务，附带管理台、账号池和 NewAPI 接入。
 
-它适合这些场景：
+**产品页：** [https://wnddd839.github.io/cursor-proxy/](https://wnddd839.github.io/cursor-proxy/)  
+**仓库：** [https://github.com/wnddd839/cursor-proxy](https://github.com/wnddd839/cursor-proxy)
 
-- 多个 Cursor 账号统一管理
-- 给 NewAPI 增加一个 OpenAI 兼容渠道
-- 给团队内部提供统一的 `/v1` API 入口
-- 在一个管理页面里完成账号导入、启用、禁用、刷新和测试
+> 仅在你拥有账号授权、并符合相关服务条款与合规要求的场景中使用。  
+> **不要**把 refresh token、管理密码或 API key 提交到仓库。
 
-> 请只在你拥有账号授权、并符合相关服务条款与公司合规要求的场景中使用。
-> 不要把 refresh token、管理密码或 API key 提交到仓库。
+---
 
-## 主要能力
+## 它能做什么
 
-- OpenAI-compatible API
-  - `GET /v1/models`
-  - `POST /v1/chat/completions`
-- Cursor Direct Gateway
-  - 直连 Cursor 上游接口
-  - 支持账号池轮询
-  - 支持 `auto`、`composer-2-fast` 等模型别名
-- 管理台
-  - `/direct-admin/`
-  - 支持单账号导入、批量导入和 OAuth 登录
-  - CodeBuddy 视图支持基于 daemon 登录态的 OAuth 添加账号
-  - 支持账号启用、禁用、删除、刷新 token 和延迟探针
-- 部署
-  - 支持 Node.js 直接运行
-  - 支持 Docker Compose
-  - 支持 Nginx 统一暴露一个公网端口
+| 能力 | 说明 |
+| --- | --- |
+| OpenAI 兼容 API | `GET /v1/models`、`POST /v1/chat/completions` |
+| Cursor Direct | 直连 Cursor 上游，账号池轮询，模型别名（如 `auto`） |
+| CodeBuddy 协议直连 | 默认 `protocol_direct`，OAuth 登录后走协议；模型列表来自 `/v3/config` |
+| 真实 Credits | 管理台调用官网 `/billing/meter/get-user-resource`，展示剩余 / 总额 |
+| 管理台 | `/direct-admin/` — OAuth、启用/禁用、刷新 token、用量查询 |
+| 部署 | Node 直跑 / Docker Compose / Nginx + systemd |
+
+默认站点为 **国内站** `codebuddy.cn`（`CURSOR_DIRECT_CODEBUDDY_SITE=domestic`）。
+
+---
 
 ## 快速开始
 
-本地运行：
+需要 **Node.js ≥ 20**。
 
 ```bash
-npm install
+git clone https://github.com/wnddd839/cursor-proxy.git
+cd cursor-proxy
+cp .env.example .env
+# 编辑 .env：填入 API Key 与管理台密码
 
 export CURSOR_DIRECT_API_KEY="replace-with-a-long-random-key"
 export CURSOR_DIRECT_ADMIN_PASSWORD="replace-with-a-long-admin-password"
@@ -52,19 +49,52 @@ API:   http://127.0.0.1:32126/v1
 Admin: http://127.0.0.1:32126/direct-admin/
 ```
 
-Docker 运行：
+Docker：
 
 ```bash
 cp .env.example .env
 docker compose up -d --build
 ```
 
-默认公网入口：
+公网入口（Compose 默认）：
 
 ```text
 http://<server-ip>:32124/v1
 http://<server-ip>:32124/direct-admin/
 ```
+
+---
+
+## CodeBuddy（协议直连）
+
+管理台品牌为 **CodeBuddy Proxy**。推荐流程：
+
+1. 打开 `/direct-admin/`，进入 CodeBuddy 面板  
+2. 站点选择 **国内站 codebuddy.cn**（默认已选）  
+3. 点击「开始认证」完成 OAuth，凭证写入账号池  
+4. 「刷新模型」走协议 `GET /v3/config`（无需 `codebuddy --serve`）  
+5. 用量列可查询官网 Credits（剩余 / 总额）
+
+客户端调用示例：
+
+```text
+POST http://<host>:32126/v1/chat/completions
+Authorization: Bearer <CURSOR_DIRECT_API_KEY>
+model: codebuddy/auto
+```
+
+常用环境变量：
+
+```text
+CURSOR_DIRECT_CODEBUDDY_TRANSPORT=protocol_direct
+CURSOR_DIRECT_CODEBUDDY_SITE=domestic
+CURSOR_DIRECT_CODEBUDDY_INTERNET_ENVIRONMENT=internal
+CURSOR_DIRECT_CODEBUDDY_BASE_URL=https://www.codebuddy.cn
+```
+
+账号池写盘带保护：非显式删除时拒绝缩减账号列表；token 刷新失败只记录 `lastError`，不会清空整个 `accounts[]`。
+
+---
 
 ## NewAPI 接入
 
@@ -72,39 +102,49 @@ http://<server-ip>:32124/direct-admin/
 
 ```text
 Base URL: http://<server-ip>:32124/v1
-API Key: CURSOR_DIRECT_API_KEY
-模型: auto / composer-2-fast / composer-2.5-fast
+API Key:  <CURSOR_DIRECT_API_KEY>
+模型:     auto / codebuddy/auto / 管理台刷新得到的上游模型名
 ```
 
-然后在管理台导入可用的 Cursor 账号即可。
+---
 
 ## 项目结构
 
 ```text
-cursor-direct-gateway.mjs    Direct Gateway 与管理 API
-direct-admin-page.mjs        管理台页面
+cursor-direct-gateway.mjs    主网关 + 管理 API
+direct-admin-page.mjs        管理台（CodeBuddy Proxy）
 admin-shared.mjs             管理台共享样式与工具
-provider-events.mjs          Provider 事件到 OpenAI/Claude 响应的转换
-codebuddy-provider.mjs       CodeBuddy HTTP/ACP Provider 适配
-codebuddy-account-pool.mjs   CodeBuddy 账号池与 daemon OAuth 登录态
+codebuddy-provider.mjs       CodeBuddy 协议 / 传输适配
+codebuddy-account-pool.mjs   账号池与写盘保护
+codebuddy-models.mjs         模型列表（/v3/config）
+codebuddy-oauth.mjs          OAuth
+codebuddy-local-creds.mjs    本地凭证
+codebuddy-cli-daemon.mjs     CLI daemon（可选）
+direct-tool-bridge.mjs       工具桥接
+provider-events.mjs          事件 → OpenAI/Claude 响应
 cursor-gateway.mjs           cursor-agent CLI 兼容网关
-deploy/                      systemd / Nginx 部署文件
-compose.yaml                 Docker Compose 部署
+deploy/                      systemd / Nginx
+compose.yaml                 Docker Compose
+docs/                        GitHub Pages 产品页
 ```
+
+---
+
+## 安全
+
+- 仓库已忽略 `.env`、`*.env`（除 `.env.example`）、账号 JSON 等  
+- 生产环境务必设置强随机 `CURSOR_DIRECT_API_KEY` 与 `CURSOR_DIRECT_ADMIN_PASSWORD`  
+- 不要把含密钥的 `cursor-direct-gateway.env` 提交或公开分享  
+
+---
 
 ## 致谢
 
-这个项目是在多个开源项目和社区实践上继续打磨出来的，感谢这些项目提供的思路和参考：
-
-- [Nomadcxx/opencode-cursor](https://github.com/Nomadcxx/opencode-cursor)
-  早期 Cursor 集成和 CLI 代理思路的重要参考。
-- [router-for-me/CLIProxyAPI](https://github.com/router-for-me/CLIProxyAPI)
-  参考了中转站部署、CLI 代理和管理体验。
-- [Quorinex/Kiro-Go](https://github.com/Quorinex/Kiro-Go)
-  参考了账号池、网关化部署和管理台交互方式。
-- NewAPI 社区生态
-  本项目的 `/v1` 兼容接口主要面向 NewAPI 渠道接入。
+- [Nomadcxx/opencode-cursor](https://github.com/Nomadcxx/opencode-cursor)  
+- [router-for-me/CLIProxyAPI](https://github.com/router-for-me/CLIProxyAPI)  
+- [Quorinex/Kiro-Go](https://github.com/Quorinex/Kiro-Go)  
+- NewAPI 社区生态  
 
 ## License
 
-本仓库按根目录 `LICENSE` 中的 BSD-3-Clause 许可发布。使用和再分发时请同时尊重相关上游项目的许可证。
+BSD-3-Clause（见根目录 `LICENSE`）。

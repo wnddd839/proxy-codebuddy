@@ -3,7 +3,7 @@ import { createServer } from "node:http";
 import net from "node:net";
 import http2 from "node:http2";
 import { spawn } from "node:child_process";
-import { existsSync, mkdirSync, readFileSync, unlinkSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readdirSync, readFileSync, unlinkSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import path from "node:path";
 import { createHash, randomUUID } from "node:crypto";
@@ -21,10 +21,13 @@ import {
   createCodeBuddyHeaders,
   normalizeBaseUrl as normalizeCodeBuddyBaseUrl,
   normalizeCodeBuddyModels,
+  resolveCodeBuddyProtocolDirectBaseUrl,
+  resolveCodeBuddyProtocolDirectEndpoint,
   runCodeBuddyCompletion,
 } from "./codebuddy-provider.mjs";
 import {
   getCodeBuddyAccountsPath,
+  hasCodeBuddyCredentials,
   importCodeBuddyAccounts,
   markCodeBuddyAccountResult,
   readCodeBuddyAccountsStore,
@@ -34,8 +37,49 @@ import {
   summarizeCodeBuddyAccountsStore,
   writeCodeBuddyAccountsStore,
 } from "./codebuddy-account-pool.mjs";
+import {
+  getCodeBuddySiteModelCatalog,
+  listCodeBuddyModelsForAccount,
+  toCodeBuddyAdminModels,
+} from "./codebuddy-models.mjs";
+import {
+  buildCodeBuddyCliCredentialFromTokenData,
+  buildCodeBuddyOAuthAccountFromTokenData,
+  pollCodeBuddyPluginAuth,
+  refreshCodeBuddyOAuthToken,
+  shouldRefreshCodeBuddyCredential,
+  startCodeBuddyPluginAuth,
+} from "./codebuddy-oauth.mjs";
+import {
+  checkCodeBuddyDaemonHealth,
+  ensureCodeBuddyDaemonRunning,
+  getCodeBuddyDaemonConfig,
+  stopCodeBuddyDaemon,
+  summarizeCodeBuddyDaemonStatus,
+} from "./codebuddy-cli-daemon.mjs";
+import {
+  readCodeBuddyLocalCredential,
+  removeCodeBuddyLocalCredentialIfMatches,
+  resolveCodeBuddyLocalCredentialPaths,
+  writeCodeBuddyLocalCredential,
+} from "./codebuddy-local-creds.mjs";
+import {
+  buildOpenAiToolsPromptLite,
+  findNativeToolUseInEvents,
+  normalizeToolUseForClient,
+  shouldBridgeClientTools,
+  synthesizeForcedToolUse,
+  synthesizeAnyToolUse,
+} from "./direct-tool-bridge.mjs";
 
 const DEFAULT_AUTH_PATH = path.join(homedir(), ".config", "cursor", "auth.json");
+const DEFAULT_CODEBUDDY_MODELS = "auto";
+const DEFAULT_CURSOR_DIRECT_MODEL = String(process.env.CURSOR_DIRECT_DEFAULT_MODEL || "composer-2.5-fast").trim() || "composer-2.5-fast";
+const CURSOR_DIRECT_MODEL_ALIASES = new Set([
+  "auto", "default", "composer-2-fast", "composer-fast", "composer-2.5",
+  "sonnet", "opus", "haiku",
+]);
+const DEFAULT_CODEBUDDY_CHAT_COMPLETIONS_PATH = "/v2/chat/completions";
 const DEFAULT_DIRECT_PARSE_LIMITS = {
   maxDepth: 8,
   maxFields: 6000,
@@ -45,6 +89,27 @@ const DEFAULT_DIRECT_PARSE_LIMITS = {
   maxFrameBytes: 4 * 1024 * 1024,
   maxTotalBytes: 8 * 1024 * 1024,
 };
+
+function firstEnvValue(...keys) {
+  for (const key of keys) {
+    const value = process.env[key];
+    if (typeof value === "string" && value.trim()) return value.trim();
+  }
+  return "";
+}
+
+function resolveDefaultCodeBuddyBaseUrl() {
+  const site = firstEnvValue("CURSOR_DIRECT_CODEBUDDY_SITE", "CODEBUDDY_SITE").toLowerCase();
+  const internetEnvironment = firstEnvValue(
+    "CURSOR_DIRECT_CODEBUDDY_INTERNET_ENVIRONMENT",
+    "CODEBUDDY_INTERNET_ENVIRONMENT",
+  ).toLowerCase();
+  if (["internal", "ioa"].includes(internetEnvironment)) return "https://copilot.tencent.com";
+  if (["domestic", "cn", "china"].includes(site) || ["domestic", "cn", "china"].includes(internetEnvironment)) {
+    return "https://www.codebuddy.cn";
+  }
+  return "https://www.codebuddy.ai";
+}
 
 const config = {
   host: process.env.CURSOR_DIRECT_HOST || "127.0.0.1",
@@ -71,8 +136,29 @@ const config = {
   codeBuddyBaseUrl:
     process.env.CURSOR_DIRECT_CODEBUDDY_BASE_URL ||
     process.env.CODEBUDDY_BASE_URL ||
-    "http://127.0.0.1:8080",
-  codeBuddyModels: process.env.CURSOR_DIRECT_CODEBUDDY_MODELS || "codebuddy/default",
+    resolveDefaultCodeBuddyBaseUrl(),
+  codeBuddySite:
+    process.env.CURSOR_DIRECT_CODEBUDDY_SITE ||
+    process.env.CODEBUDDY_SITE ||
+    "",
+  codeBuddyApiEndpoint:
+    process.env.CURSOR_DIRECT_CODEBUDDY_API_ENDPOINT ||
+    process.env.CODEBUDDY_API_ENDPOINT ||
+    "",
+  codeBuddyChatCompletionsPath:
+    process.env.CURSOR_DIRECT_CODEBUDDY_CHAT_COMPLETIONS_PATH ||
+    process.env.CODEBUDDY_CHAT_COMPLETIONS_PATH ||
+    DEFAULT_CODEBUDDY_CHAT_COMPLETIONS_PATH,
+  codeBuddyInternetEnvironment:
+    process.env.CURSOR_DIRECT_CODEBUDDY_INTERNET_ENVIRONMENT ||
+    process.env.CODEBUDDY_INTERNET_ENVIRONMENT ||
+    "",
+  codeBuddyModels: process.env.CURSOR_DIRECT_CODEBUDDY_MODELS || DEFAULT_CODEBUDDY_MODELS,
+  codeBuddyTransportConfigured: Boolean(process.env.CURSOR_DIRECT_CODEBUDDY_TRANSPORT || process.env.CODEBUDDY_TRANSPORT),
+  codeBuddyTransport: String(process.env.CURSOR_DIRECT_CODEBUDDY_TRANSPORT || process.env.CODEBUDDY_TRANSPORT || "protocol_direct").toLowerCase(),
+  codeBuddyServeUrl: process.env.CURSOR_DIRECT_CODEBUDDY_SERVE_URL || process.env.CODEBUDDY_SERVE_URL || "http://127.0.0.1:8080",
+  codeBuddyBin: process.env.CURSOR_DIRECT_CODEBUDDY_BIN || process.env.CODEBUDDY_BIN || "codebuddy",
+  codeBuddyRunTimeoutMs: Number(process.env.CURSOR_DIRECT_CODEBUDDY_RUN_TIMEOUT_MS || process.env.CODEBUDDY_RUN_TIMEOUT_MS || "0"),
   apiBaseUrl: process.env.CURSOR_DIRECT_API_BASE_URL || "https://api2.cursor.sh",
   agentHost: process.env.CURSOR_DIRECT_AGENT_HOST || "agentn.api5.cursor.sh",
   clientVersion: process.env.CURSOR_DIRECT_CLIENT_VERSION || "cli-2026.05.24-dda726e",
@@ -212,6 +298,7 @@ function createDirectMetadataCaches() {
     authSummary: createMetadataCacheEntry(),
     oauthSession: createMetadataCacheEntry(),
     codeBuddyOAuthSession: createMetadataCacheEntry(),
+    codeBuddyModels: createMetadataCacheEntry(),
   };
 }
 
@@ -244,6 +331,7 @@ function invalidateDirectMetadataCaches(caches = metadataCaches) {
   clearMetadataCache(caches.authSummary);
   clearMetadataCache(caches.oauthSession);
   clearMetadataCache(caches.codeBuddyOAuthSession);
+  clearMetadataCache(caches.codeBuddyModels);
 }
 
 function log(level, message, meta = undefined) {
@@ -260,18 +348,18 @@ function normalizeDirectModel(model) {
     .replace(/^cursor-acp\//, "")
     .replace(/^cursor\//, "")
     .replace(/^cursor-/, "");
-  const anthropicAlias = normalizeAnthropicModelAlias(cleaned);
-  if (anthropicAlias) return anthropicAlias;
-  return ["auto", "default", "sonnet", "opus", "haiku"].includes(cleaned) ? "default" : cleaned;
+  if (normalizeAnthropicModelAlias(cleaned)) return DEFAULT_CURSOR_DIRECT_MODEL;
+  if (CURSOR_DIRECT_MODEL_ALIASES.has(cleaned)) return DEFAULT_CURSOR_DIRECT_MODEL;
+  return cleaned || DEFAULT_CURSOR_DIRECT_MODEL;
 }
 
 function sanitizeModelName(model) {
-  const raw = typeof model === "string" && model.trim() ? model.trim() : "auto";
+  const raw = typeof model === "string" && model.trim() ? model.trim() : DEFAULT_CURSOR_DIRECT_MODEL;
   return raw
     .replace(/\x1B\[[0-?]*[ -/]*[@-~]/g, "")
     .replace(/\[(?:\d{1,3}(?:;\d{1,3})*)m\]?/g, "")
     .replace(/[\u0000-\u001F\u007F]/g, "")
-    .trim() || "auto";
+    .trim() || DEFAULT_CURSOR_DIRECT_MODEL;
 }
 
 function normalizePublicModelName(model) {
@@ -279,7 +367,8 @@ function normalizePublicModelName(model) {
     .replace(/^cursor-acp\//, "")
     .replace(/^cursor\//, "")
     .replace(/^cursor-/, "");
-  return cleaned === "default" ? "auto" : cleaned;
+  if (CURSOR_DIRECT_MODEL_ALIASES.has(cleaned)) return DEFAULT_CURSOR_DIRECT_MODEL;
+  return cleaned || DEFAULT_CURSOR_DIRECT_MODEL;
 }
 
 function normalizeApiPath(pathname) {
@@ -310,14 +399,18 @@ function normalizeAnthropicModelAlias(model) {
 }
 
 function displayModelId(model) {
-  return model === "default" ? "auto" : model;
+  if (!model || model === "default" || CURSOR_DIRECT_MODEL_ALIASES.has(String(model))) {
+    return DEFAULT_CURSOR_DIRECT_MODEL;
+  }
+  return model;
 }
 
 function resolveGatewayProviderModel(model) {
   const cleaned = sanitizeModelName(model);
   const codeBuddyMatch = cleaned.match(/^codebuddy(?:(?:\/|:)(.*))?$/i);
   if (codeBuddyMatch) {
-    const upstreamModel = String(codeBuddyMatch[1] || "default").trim() || "default";
+    const requestedModel = String(codeBuddyMatch[1] || "auto").trim() || "auto";
+    const upstreamModel = requestedModel === "default" ? "auto" : requestedModel;
     return {
       provider: "codebuddy",
       model: upstreamModel,
@@ -334,14 +427,44 @@ function resolveGatewayProviderModel(model) {
 
 function normalizeCodeBuddyPublicModelId(model) {
   const cleaned = sanitizeModelName(model);
+  if (!cleaned || cleaned === "default" || cleaned === "auto") {
+    return "codebuddy/auto";
+  }
   if (/^codebuddy(?:\/|:|$)/i.test(cleaned)) {
     return resolveGatewayProviderModel(cleaned).publicModel;
   }
-  return `codebuddy/${cleaned || "default"}`;
+  return `codebuddy/${cleaned}`;
 }
 
-function listConfiguredCodeBuddyModels() {
-  const raw = String(config.codeBuddyModels || "codebuddy/default").trim();
+function inferConfiguredCodeBuddySite() {
+  const site = String(config.codeBuddySite || "").toLowerCase();
+  if (["domestic", "cn", "china", "internal", "ioa"].includes(site)) return "domestic";
+  if (["global", "public", "intl", "international"].includes(site)) return "global";
+  const internetEnvironment = String(config.codeBuddyInternetEnvironment || "").toLowerCase();
+  if (["internal", "ioa"].includes(internetEnvironment)) return "domestic";
+  const baseUrl = String(config.codeBuddyBaseUrl || "").toLowerCase();
+  if (baseUrl.includes("codebuddy.cn") || baseUrl.includes("copilot.tencent.com")) return "domestic";
+  return "global";
+}
+
+function resolveConfiguredCodeBuddyChatEndpoint() {
+  if (config.codeBuddyTransport === "cli_daemon") return config.codeBuddyServeUrl;
+  if (config.codeBuddyTransport === "protocol_direct") {
+    return resolveCodeBuddyProtocolDirectEndpoint({
+      site: config.codeBuddySite || inferConfiguredCodeBuddySite(),
+      internetEnvironment: config.codeBuddyInternetEnvironment,
+      baseUrl: config.codeBuddyBaseUrl,
+      apiEndpoint: config.codeBuddyApiEndpoint,
+      chatCompletionsPath: config.codeBuddyChatCompletionsPath,
+    });
+  }
+  return config.codeBuddyApiEndpoint
+    || `${normalizeCodeBuddyBaseUrl(config.codeBuddyBaseUrl)}${config.codeBuddyChatCompletionsPath}`;
+}
+
+function listConfiguredCodeBuddyModels(options = {}) {
+  const site = options.site || inferConfiguredCodeBuddySite();
+  const raw = String(config.codeBuddyModels || DEFAULT_CODEBUDDY_MODELS).trim();
   let rows = [];
   if (raw.startsWith("[") || raw.startsWith("{")) {
     try {
@@ -350,34 +473,95 @@ function listConfiguredCodeBuddyModels() {
       rows = [];
     }
   }
-  if (rows.length === 0) {
+  if (rows.length === 0 && raw) {
     rows = raw
       .split(",")
       .map((value) => value.trim())
       .filter(Boolean)
       .map((id) => ({
-        id: normalizeCodeBuddyPublicModelId(id),
-        object: "model",
-        name: normalizeCodeBuddyPublicModelId(id),
-        owned_by: "codebuddy",
+        id: id.replace(/^codebuddy[:/]/i, ""),
+        name: id,
         supportsTools: true,
         supportsImages: false,
       }));
-  } else {
-    rows = rows.map((model) => ({
-      ...model,
-      id: normalizeCodeBuddyPublicModelId(model.id),
-      name: model.name || normalizeCodeBuddyPublicModelId(model.id),
-    }));
   }
-  return rows.length > 0 ? rows : [{
-    id: "codebuddy/default",
-    object: "model",
-    name: "codebuddy/default",
-    owned_by: "codebuddy",
-    supportsTools: true,
-    supportsImages: false,
-  }];
+  if (rows.length === 0) {
+    return toCodeBuddyAdminModels(getCodeBuddySiteModelCatalog(site), {
+      source: "site_catalog",
+      verifiedIds: ["auto"],
+    });
+  }
+  return toCodeBuddyAdminModels(rows, {
+    source: "configured",
+    verifiedIds: rows.map((model) => model.id),
+  });
+}
+
+async function listCodeBuddyModelsForAdmin(options = {}) {
+  const store = readCodeBuddyStore();
+  const selection = selectCodeBuddyAccount(store, { accountId: options.accountId || "" });
+  const account = selection?.account;
+  const site = account?.site || inferConfiguredCodeBuddySite();
+  const cacheKey = account?.id
+    ? `${account.id}:${account.credentialHash || ""}:${site}`
+    : `site:${site}`;
+  const cache = metadataCaches.codeBuddyModels;
+  const now = Date.now();
+
+  if (!options.fresh && !options.discover) {
+    const cached = getMetadataCache(cache, { now });
+    if (cached?.cacheKey === cacheKey && cached?.payload) {
+      return cloneMetadataValue(cached.payload);
+    }
+  }
+
+  let payload;
+  if (!account || !hasCodeBuddyCredentials(account)) {
+    payload = {
+      ok: false,
+      provider: "codebuddy",
+      site,
+      models: listConfiguredCodeBuddyModels({ site }),
+      modelsSource: "no_credentials",
+      message: "Complete CodeBuddy OAuth login, then refresh models.",
+    };
+  } else {
+    const transport = config.codeBuddyTransportConfigured
+      ? config.codeBuddyTransport
+      : (account.transport || config.codeBuddyTransport);
+    const accountForRequest = { ...account, transport };
+    const headers = await resolveCodeBuddyAccountHeaders(accountForRequest, {
+      site: account.site || site,
+      internetEnvironment: account.internetEnvironment || config.codeBuddyInternetEnvironment,
+      baseUrl: account.baseUrl || config.codeBuddyBaseUrl,
+      apiEndpoint: account.apiEndpoint || config.codeBuddyApiEndpoint,
+      chatCompletionsPath: account.chatCompletionsPath || config.codeBuddyChatCompletionsPath,
+    });
+    payload = {
+      ok: true,
+      provider: "codebuddy",
+      accountId: account.id,
+      ...(await listCodeBuddyModelsForAccount({
+        site: account.site || site,
+        baseUrl: account.baseUrl || config.codeBuddyBaseUrl,
+        apiEndpoint: account.apiEndpoint || config.codeBuddyApiEndpoint,
+        chatCompletionsPath: account.chatCompletionsPath || config.codeBuddyChatCompletionsPath,
+        bearerToken: account.bearerToken,
+        apiKey: account.apiKey,
+        userId: account.authStatus?.userId,
+        headers,
+        transport,
+        daemonBaseUrl: account.daemonBaseUrl || config.codeBuddyServeUrl,
+        gatewayPassword: process.env.CURSOR_DIRECT_CODEBUDDY_GATEWAY_PASSWORD || process.env.CODEBUDDY_GATEWAY_PASSWORD || "",
+        discover: options.discover === true,
+        fetchImpl: globalThis.fetch,
+      })),
+    };
+  }
+
+  const result = cloneMetadataValue(payload);
+  setMetadataCache(cache, { cacheKey, payload: result }, { now, ttlMs: config.modelsCacheTtlMs });
+  return result;
 }
 
 function base64UrlDecode(input) {
@@ -422,6 +606,13 @@ function maskSecret(value, visible = 4) {
   if (!text) return "";
   if (text.length <= visible * 2) return `${text.slice(0, Math.max(1, visible))}...`;
   return `${text.slice(0, visible)}...${text.slice(-visible)}`;
+}
+
+function redactCredentialText(value = "") {
+  return String(value || "")
+    .replace(/eyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+/g, "<redacted-jwt>")
+    .replace(/(refresh[_-]?token["'\s:=]+)[A-Za-z0-9._-]+/gi, "$1<redacted>")
+    .replace(/(access[_-]?token["'\s:=]+)[A-Za-z0-9._-]+/gi, "$1<redacted>");
 }
 
 function summarizeCursorAuth(auth, options = {}) {
@@ -471,6 +662,8 @@ function createCodeBuddyOAuthSessionState() {
     token: "",
     provider: "codebuddy",
     status: "idle",
+    site: "global",
+    authState: "",
     url: "",
     launchUrl: "",
     accessUrl: "",
@@ -755,7 +948,14 @@ function selectDirectAccount(store, options = {}) {
 
 function readLegacyDirectAccount() {
   try {
-    return createLegacyDirectAccount(readAuthFile(), { authPath: config.authPath });
+    const legacy = createLegacyDirectAccount(readAuthFile(), { authPath: config.authPath });
+    const store = readAccountsStore();
+    const duplicated = store.accounts.some((account) => (
+      (legacy.subject && account.subject === legacy.subject) ||
+      (legacy.email && account.email === legacy.email) ||
+      (legacy.refreshToken && account.refreshToken === legacy.refreshToken)
+    ));
+    return duplicated ? null : legacy;
   } catch {
     return null;
   }
@@ -820,12 +1020,308 @@ function markDirectAccountResult(selection, ok, details = {}) {
   }));
 }
 
+function getCodeBuddyOAuthSessionPath() {
+  const accountsPath = config.codeBuddyAccountsPath || path.join(homedir(), ".codebuddy", "proxy-accounts.json");
+  return path.join(path.dirname(accountsPath), "codebuddy-oauth-session.json");
+}
+
+function persistCodeBuddyOAuthSession() {
+  const sessionPath = getCodeBuddyOAuthSessionPath();
+  if (!codeBuddyOAuthSession.authState && codeBuddyOAuthSession.status !== "complete") return;
+  const payload = {
+    id: codeBuddyOAuthSession.id,
+    token: codeBuddyOAuthSession.token,
+    provider: codeBuddyOAuthSession.provider,
+    authState: codeBuddyOAuthSession.authState,
+    site: codeBuddyOAuthSession.site,
+    status: codeBuddyOAuthSession.status,
+    url: codeBuddyOAuthSession.url,
+    label: codeBuddyOAuthSession.label,
+    startedAt: codeBuddyOAuthSession.startedAt,
+    updatedAt: codeBuddyOAuthSession.updatedAt,
+    completedAt: codeBuddyOAuthSession.completedAt,
+    error: codeBuddyOAuthSession.error,
+  };
+  mkdirSync(path.dirname(sessionPath), { recursive: true });
+  writeFileSync(sessionPath, `${JSON.stringify(payload, null, 2)}\n`, { mode: 0o600 });
+}
+
+function restoreCodeBuddyOAuthSessionFromDisk() {
+  const sessionPath = getCodeBuddyOAuthSessionPath();
+  if (!existsSync(sessionPath)) return false;
+  try {
+    const saved = JSON.parse(readFileSync(sessionPath, "utf8"));
+    const startedAt = Number(saved?.startedAt || 0);
+    if (!saved?.authState || !startedAt) return false;
+    if (Date.now() - startedAt > CODEBUDDY_OAUTH_SESSION_TTL_MS) return false;
+    codeBuddyOAuthSession = {
+      ...createCodeBuddyOAuthSessionState(),
+      ...saved,
+      login: codeBuddyOAuthSession.login,
+    };
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function applyCodeBuddyOAuthSessionHints(options = {}) {
+  if (!codeBuddyOAuthSession.authState) {
+    restoreCodeBuddyOAuthSessionFromDisk();
+  }
+  if (options.authState) codeBuddyOAuthSession.authState = compactText(options.authState);
+  if (options.site) codeBuddyOAuthSession.site = compactText(options.site) || codeBuddyOAuthSession.site;
+  if (options.label) codeBuddyOAuthSession.label = compactText(options.label) || codeBuddyOAuthSession.label;
+}
+
+function clearCodeBuddyOAuthSessionPersistence() {
+  const sessionPath = getCodeBuddyOAuthSessionPath();
+  if (existsSync(sessionPath)) unlinkSync(sessionPath);
+}
+
 function readCodeBuddyStore() {
   return readCodeBuddyAccountsStore({ accountsPath: config.codeBuddyAccountsPath });
 }
 
-function writeCodeBuddyStore(store) {
-  return writeCodeBuddyAccountsStore(store, { accountsPath: config.codeBuddyAccountsPath });
+function writeCodeBuddyStore(store, options = {}) {
+  clearMetadataCache(metadataCaches.codeBuddyModels);
+  return writeCodeBuddyAccountsStore(store, {
+    accountsPath: config.codeBuddyAccountsPath,
+    allowShrink: options.allowShrink === true,
+  });
+}
+
+function resolveCodeBuddyOfficialUsageUrl(site = "domestic") {
+  const normalized = String(site || "").toLowerCase();
+  if (["global", "public", "intl", "international"].includes(normalized)) {
+    return "https://www.codebuddy.ai/profile/plan";
+  }
+  return "https://www.codebuddy.cn/profile/plan";
+}
+
+function resolveCodeBuddyBillingBaseUrl(site = "domestic", options = {}) {
+  const configured = String(options.billingBaseUrl || process.env.CODEBUDDY_BILLING_BASE_URL || "").trim();
+  if (configured) return normalizeCodeBuddyBaseUrl(configured);
+  const normalized = String(site || "").toLowerCase();
+  if (["global", "public", "intl", "international"].includes(normalized)) {
+    return "https://www.codebuddy.ai";
+  }
+  // Domestic website billing host; also works via copilot.tencent.com.
+  return "https://www.codebuddy.cn";
+}
+
+function mapCodeBuddyDosageNotify(data = {}) {
+  const code = Number(data?.dosageNotifyCode ?? data?.code ?? 0);
+  const map = {
+    0: { level: "ok", label: "用量正常", hint: "当前未触发用量告警" },
+    1: { level: "warn", label: "用量提醒", hint: "接近额度，建议关注官网套餐与用量" },
+    2: { level: "bad", label: "用量不足", hint: "额度可能不足，请到官网查看套餐与用量" },
+    3: { level: "bad", label: "用量耗尽", hint: "额度可能已耗尽，请到官网充值或升级" },
+  };
+  const mapped = map[code] || {
+    level: code === 0 ? "ok" : "warn",
+    label: `通知码 ${code}`,
+    hint: String(data?.dosageNotifyZh || data?.dosageNotifyEn || "已收到用量通知").trim(),
+  };
+  return {
+    dosageNotifyCode: code,
+    dosageNotifyZh: String(data?.dosageNotifyZh || "").trim(),
+    dosageNotifyEn: String(data?.dosageNotifyEn || "").trim(),
+    skipUrl: String(data?.skipUrl || "").trim(),
+    ...mapped,
+  };
+}
+
+function toFiniteNumber(value) {
+  if (value == null || value === "" || value === "-") return null;
+  const num = Number(value);
+  return Number.isFinite(num) ? num : null;
+}
+
+function summarizeCodeBuddyResourceAccounts(accounts = []) {
+  const packages = [];
+  let remaining = 0;
+  let total = 0;
+  let used = 0;
+  let hasUnlimited = false;
+  for (const item of Array.isArray(accounts) ? accounts : []) {
+    const capacityType = Number(item?.CapacityType ?? item?.capacityType ?? 0);
+    let left = null;
+    let size = null;
+    let usedAmount = null;
+    if (capacityType === 4 && Array.isArray(item?.SlicePeriodUsageDetails) && item.SlicePeriodUsageDetails[0]) {
+      const slice = item.SlicePeriodUsageDetails[0];
+      left = toFiniteNumber(slice.SlicePeriodCapacityRemainPrecise ?? slice.SlicePeriodCapacityRemain);
+      size = toFiniteNumber(slice.SlicePeriodCapacitySizePrecise ?? slice.SlicePeriodCapacitySize);
+      usedAmount = toFiniteNumber(slice.SlicePeriodCapacityUsedPrecise ?? slice.SlicePeriodCapacityUsed);
+    } else {
+      left = toFiniteNumber(
+        item?.CycleCapacityRemainPrecise ??
+        item?.CycleCapacityRemain ??
+        item?.CapacityRemainPrecise ??
+        item?.CapacityRemain,
+      );
+      size = toFiniteNumber(
+        item?.CycleCapacitySizePrecise ??
+        item?.CycleCapacitySize ??
+        item?.CapacitySizePrecise ??
+        item?.CapacitySize,
+      );
+      usedAmount = toFiniteNumber(
+        item?.CycleCapacityUsedPrecise ??
+        item?.CycleCapacityUsed ??
+        item?.CapacityUsedPrecise ??
+        item?.CapacityUsed,
+      );
+    }
+    if (size === -1 || left === -1) hasUnlimited = true;
+    if (left != null && left >= 0) remaining += left;
+    if (size != null && size >= 0) total += size;
+    if (usedAmount != null && usedAmount >= 0) used += usedAmount;
+    else if (left != null && size != null && size >= 0 && left >= 0) used += Math.max(0, size - left);
+    packages.push({
+      packageCode: String(item?.PackageCode || item?.packageCode || "").trim(),
+      packageName: String(item?.PackageName || item?.packageName || "").trim(),
+      resourceId: String(item?.ResourceId || item?.resourceId || "").trim(),
+      status: item?.Status ?? item?.status ?? null,
+      capacityType,
+      unit: String(item?.CapacityUnit || item?.OriginUnit || "credits").trim() || "credits",
+      remaining: left,
+      total: size,
+      used: usedAmount,
+      cycleStartTime: item?.CycleStartTime || item?.cycleStartTime || "",
+      cycleEndTime: item?.CycleEndTime || item?.cycleEndTime || "",
+    });
+  }
+  if (used <= 0 && total > 0 && remaining >= 0) used = Math.max(0, total - remaining);
+  const percent = total > 0 ? Math.min(100, Math.round((used / total) * 100)) : null;
+  return {
+    remaining: hasUnlimited ? null : remaining,
+    total: hasUnlimited ? null : total,
+    used: hasUnlimited ? null : used,
+    percent,
+    unlimited: hasUnlimited,
+    unit: "credits",
+    packages,
+  };
+}
+
+async function postCodeBuddyJson(endpoint, body, options = {}) {
+  const fetchImpl = options.fetchImpl || globalThis.fetch;
+  const response = await fetchImpl(endpoint, {
+    method: "POST",
+    headers: {
+      ...(options.headers || {}),
+      accept: "application/json",
+      "content-type": "application/json",
+    },
+    body: JSON.stringify(body ?? {}),
+    signal: options.signal,
+  });
+  const text = await response.text();
+  let payload = {};
+  try {
+    payload = text ? JSON.parse(text) : {};
+  } catch {
+    payload = { raw: text };
+  }
+  return { response, payload, text };
+}
+
+async function fetchCodeBuddyAccountUsage(account, options = {}) {
+  const site = account?.site || inferConfiguredCodeBuddySite();
+  const billingBaseUrl = resolveCodeBuddyBillingBaseUrl(site, options);
+  const protocolBaseUrl = resolveCodeBuddyProtocolDirectBaseUrl({
+    site,
+    internetEnvironment: account?.internetEnvironment || config.codeBuddyInternetEnvironment,
+    baseUrl: account?.baseUrl || config.codeBuddyBaseUrl,
+  });
+  const headers = await resolveCodeBuddyAccountHeaders({
+    ...account,
+    transport: account?.transport || config.codeBuddyTransport || "protocol_direct",
+  }, {
+    site,
+    internetEnvironment: account?.internetEnvironment || config.codeBuddyInternetEnvironment,
+    baseUrl: account?.baseUrl || config.codeBuddyBaseUrl,
+    apiEndpoint: account?.apiEndpoint || config.codeBuddyApiEndpoint,
+    chatCompletionsPath: account?.chatCompletionsPath || config.codeBuddyChatCompletionsPath,
+  });
+  const bearer = String(account?.bearerToken || account?.accessToken || headers.authorization || headers.Authorization || "")
+    .replace(/^Bearer\s+/i, "")
+    .trim();
+  const billingHeaders = {
+    authorization: bearer ? `Bearer ${bearer}` : (headers.authorization || headers.Authorization || ""),
+    "x-requested-with": "XMLHttpRequest",
+  };
+  if (account?.enterpriseId) billingHeaders["x-enterprise-id"] = String(account.enterpriseId);
+
+  const resourceEndpoint = `${normalizeCodeBuddyBaseUrl(billingBaseUrl)}/billing/meter/get-user-resource`;
+  const resourceBody = {
+    PageNumber: 1,
+    PageSize: 200,
+    ProductCode: "p_tcaca",
+    Status: [0, 3],
+    OnlyValidPeriod: true,
+  };
+  const resourceResult = await postCodeBuddyJson(resourceEndpoint, resourceBody, {
+    fetchImpl: options.fetchImpl,
+    signal: options.signal,
+    headers: billingHeaders,
+  });
+  if (!resourceResult.response.ok || (resourceResult.payload?.code != null && Number(resourceResult.payload.code) !== 0)) {
+    const message = resourceResult.payload?.msg || resourceResult.payload?.message || resourceResult.payload?.error || `HTTP ${resourceResult.response.status}`;
+    throw new Error(`CodeBuddy credits query failed: ${String(message).slice(0, 240)}`);
+  }
+  const accounts = resourceResult.payload?.data?.Response?.Data?.Accounts
+    || resourceResult.payload?.data?.Accounts
+    || resourceResult.payload?.Accounts
+    || [];
+  const credits = summarizeCodeBuddyResourceAccounts(accounts);
+
+  let notify = null;
+  const notifyEndpoint = `${normalizeCodeBuddyBaseUrl(protocolBaseUrl)}/v2/billing/meter/get-dosage-notify`;
+  try {
+    const notifyResult = await postCodeBuddyJson(notifyEndpoint, {}, {
+      fetchImpl: options.fetchImpl,
+      signal: options.signal,
+      headers,
+    });
+    if (notifyResult.response.ok && (notifyResult.payload?.code == null || Number(notifyResult.payload.code) === 0)) {
+      notify = mapCodeBuddyDosageNotify(notifyResult.payload?.data || notifyResult.payload || {});
+    }
+  } catch {
+    notify = null;
+  }
+
+  const remainingLabel = credits.unlimited
+    ? "不限量"
+    : (credits.remaining == null ? "-" : String(credits.remaining));
+  const totalLabel = credits.unlimited
+    ? "不限量"
+    : (credits.total == null ? "-" : String(credits.total));
+  const primary = credits.packages[0] || null;
+  return {
+    ok: true,
+    provider: "codebuddy",
+    accountId: account?.id || "",
+    site,
+    endpoint: resourceEndpoint,
+    officialUsageUrl: resolveCodeBuddyOfficialUsageUrl(site),
+    note: "剩余 Credits 来自官网套餐接口 /billing/meter/get-user-resource。",
+    credits: {
+      ...credits,
+      label: `${remainingLabel} / ${totalLabel}`,
+      display: `剩余 ${remainingLabel}${credits.unlimited ? "" : ` / ${totalLabel}`} Credits`,
+      packageName: primary?.packageName || "",
+      cycleStartTime: primary?.cycleStartTime || "",
+      cycleEndTime: primary?.cycleEndTime || "",
+    },
+    notify,
+    raw: {
+      resource: resourceResult.payload?.data || {},
+      notify: notify || null,
+    },
+  };
 }
 
 function summarizeCodeBuddyStore(store) {
@@ -844,7 +1340,9 @@ function updateStoredCodeBuddyAccount(accountId, updater) {
 
 function selectCodeBuddyAccountFromPool(options = {}) {
   const selected = selectCodeBuddyAccount(readCodeBuddyStore(), {
-    accountId: options.accountId,
+    accountId: options.accountId || "",
+    site: options.site,
+    excludeAccountIds: options.excludeAccountIds,
   });
   if (selected.source === "pool") {
     const store = writeCodeBuddyStore(selected.store);
@@ -853,18 +1351,157 @@ function selectCodeBuddyAccountFromPool(options = {}) {
   return selected;
 }
 
+async function refreshCodeBuddySelectedAccount(selection, options = {}) {
+  if (!selection?.account || selection.source !== "pool") return selection;
+  const account = selection.account;
+  const force = options.force === true;
+  if (!account.refreshToken && force) {
+    throw new Error("CodeBuddy account has no refresh token; please re-authenticate from /direct-admin/#codebuddy.");
+  }
+  const refreshWindowMs = Number(
+    options.refreshWindowMs ||
+    process.env.CURSOR_DIRECT_CODEBUDDY_REFRESH_WINDOW_MS ||
+    process.env.CODEBUDDY_REFRESH_WINDOW_MS ||
+    10 * 60 * 1000,
+  );
+  if (!shouldRefreshCodeBuddyCredential(account, { force, refreshWindowMs })) {
+    return selection;
+  }
+
+  try {
+    const tokenData = await refreshCodeBuddyOAuthToken({
+      site: account.site || config.codeBuddySite,
+      baseUrl: account.baseUrl || config.codeBuddyBaseUrl,
+      refreshEndpoint: process.env.CURSOR_DIRECT_CODEBUDDY_REFRESH_ENDPOINT || process.env.CODEBUDDY_REFRESH_ENDPOINT || "",
+      accessToken: account.bearerToken,
+      bearerToken: account.bearerToken,
+      refreshToken: account.refreshToken,
+      fetchImpl: options.fetchImpl,
+      signal: options.signal,
+    });
+    const credential = buildCodeBuddyCliCredentialFromTokenData(tokenData, {
+      site: account.site || config.codeBuddySite || "global",
+      label: account.label,
+    });
+    const accountInput = {
+      ...credential,
+      id: account.id,
+      enabled: account.enabled !== false,
+      baseUrl: account.baseUrl,
+      internetEnvironment: account.internetEnvironment,
+      apiEndpoint: account.apiEndpoint,
+      chatCompletionsPath: account.chatCompletionsPath,
+      transport: account.transport || config.codeBuddyTransport,
+      daemonBaseUrl: account.daemonBaseUrl || config.codeBuddyServeUrl,
+    };
+    const imported = importCodeBuddyAccounts(readCodeBuddyStore(), accountInput);
+    const store = writeCodeBuddyStore(imported.store);
+    const refreshedAccount = store.accounts.find((item) => item.id === account.id) || imported.imported[0] || account;
+    writeCodeBuddyLocalCredential(credential);
+    if ((refreshedAccount.transport || config.codeBuddyTransport) === "cli_daemon") {
+      stopCodeBuddyDaemon();
+    }
+    log("info", "codebuddy oauth credential refreshed", {
+      accountId: refreshedAccount.id,
+      site: refreshedAccount.site,
+      tokenExpiresAt: refreshedAccount.tokenExpiresAt || 0,
+    });
+    return {
+      ...selection,
+      account: refreshedAccount,
+      store,
+      refreshedCodeBuddyToken: true,
+    };
+  } catch (error) {
+    const message = redactCredentialText(error instanceof Error ? error.message : String(error)).slice(0, 400);
+    updateStoredCodeBuddyAccount(account.id, (current) => ({
+      ...current,
+      lastError: `token refresh failed: ${message}`,
+      updatedAt: Date.now(),
+    }));
+    const expired = Number(account.tokenExpiresAt || 0) > 0 && Number(account.tokenExpiresAt || 0) <= Date.now();
+    if (force || expired) {
+      throw new Error(`CodeBuddy OAuth refresh failed; please re-authenticate from /direct-admin/#codebuddy. ${message}`);
+    }
+    log("warn", "codebuddy oauth refresh skipped after failure", {
+      accountId: account.id,
+      site: account.site,
+      message,
+    });
+    return selection;
+  }
+}
+
+function shouldRefreshCodeBuddyAfterFailure(error, selection, options = {}) {
+  if (options._codeBuddyRefreshRetry) return false;
+  const account = selection?.account || {};
+  if (!account.refreshToken) return false;
+  const message = String(error instanceof Error ? error.message : error || "").toLowerCase();
+  if (!message) return false;
+  if (/11140|request illegal/.test(message)) return false;
+  return /(?:\b401\b|\b403\b|unauthori[sz]ed|forbidden|token|credential|auth|login|not authenticated|未登录|登录|凭证)/i.test(message);
+}
+
+function shouldRetryCodeBuddyWithNextAccount(error, selection, options = {}) {
+  if (options.accountId) return false;
+  const account = selection?.account || {};
+  if (!account.id) return false;
+  const tried = Array.isArray(options._codeBuddyTriedAccountIds) ? options._codeBuddyTriedAccountIds : [];
+  if (tried.includes(account.id)) return false;
+  const message = String(error instanceof Error ? error.message : error || "");
+  if (!message) return false;
+  if (shouldRefreshCodeBuddyAfterFailure(error, selection, options)) return false;
+  return /11140|11101|request illegal|site mismatch|invalid request/i.test(message);
+}
+
+function resolveCodeBuddyPoolSiteFilter(options = {}) {
+  if (compactText(options.accountId || "")) return "";
+  return compactText(config.codeBuddySite || "");
+}
+
 async function runCodeBuddyCompletionFromPool(messages = [], options = {}) {
-  const selection = selectCodeBuddyAccountFromPool({ accountId: options.accountId });
-  const headers = await resolveCodeBuddyAccountHeaders(selection.account);
+  const triedAccountIds = Array.isArray(options._codeBuddyTriedAccountIds) ? options._codeBuddyTriedAccountIds : [];
+  let selection = selectCodeBuddyAccountFromPool({
+    accountId: options.accountId,
+    site: resolveCodeBuddyPoolSiteFilter(options),
+    excludeAccountIds: triedAccountIds,
+  });
+  selection = await refreshCodeBuddySelectedAccount(selection, {
+    fetchImpl: options.fetchImpl,
+    signal: options.signal,
+  });
+  const transport = config.codeBuddyTransportConfigured
+    ? config.codeBuddyTransport
+    : (selection.account.transport || config.codeBuddyTransport);
+  const accountForRequest = { ...selection.account, transport };
+  const headers = await resolveCodeBuddyAccountHeaders(accountForRequest, {
+    site: selection.account.site || config.codeBuddySite,
+    internetEnvironment: selection.account.internetEnvironment || config.codeBuddyInternetEnvironment,
+    baseUrl: selection.account.baseUrl || config.codeBuddyBaseUrl,
+    apiEndpoint: selection.account.apiEndpoint || config.codeBuddyApiEndpoint,
+    chatCompletionsPath: selection.account.chatCompletionsPath || config.codeBuddyChatCompletionsPath,
+  });
   let emittedOnAttempt = false;
   try {
-    const result = await runCodeBuddyCompletion(messages, {
-      baseUrl: selection.account.baseUrl || config.codeBuddyBaseUrl,
+      const result = await runCodeBuddyCompletion(messages, {
+        transport,
+        site: selection.account.site || config.codeBuddySite,
+        internetEnvironment: selection.account.internetEnvironment || config.codeBuddyInternetEnvironment,
+        daemonBaseUrl: selection.account.daemonBaseUrl || config.codeBuddyServeUrl,
+        baseUrl: selection.account.baseUrl || config.codeBuddyBaseUrl,
+      apiEndpoint: selection.account.apiEndpoint || config.codeBuddyApiEndpoint,
+      chatCompletionsPath: selection.account.chatCompletionsPath || config.codeBuddyChatCompletionsPath,
+      token: selection.account.bearerToken || selection.account.apiKey,
+      bearerToken: selection.account.bearerToken,
+      apiKey: selection.account.apiKey,
+      userId: selection.account.authStatus?.userId || "",
       headers,
       model: options.model,
+      stream: options.stream !== false,
       tools: options.tools,
       toolChoice: options.toolChoice,
       signal: options.signal,
+      daemonRunTimeoutMs: options.daemonRunTimeoutMs ?? config.codeBuddyRunTimeoutMs,
       fetchImpl: options.fetchImpl,
       onEvent: options.onEvent,
       onDelta: (delta) => {
@@ -880,6 +1517,38 @@ async function runCodeBuddyCompletionFromPool(messages = [], options = {}) {
       emittedOnAttempt,
     };
   } catch (error) {
+    if (shouldRetryCodeBuddyWithNextAccount(error, selection, options)) {
+      log("warn", "retrying codebuddy request with next account", {
+        accountId: selection.account?.id || "",
+        error: error instanceof Error ? error.message : String(error),
+      });
+      return await runCodeBuddyCompletionFromPool(messages, {
+        ...options,
+        accountId: "",
+        _codeBuddyTriedAccountIds: [...triedAccountIds, selection.account.id],
+      });
+    }
+    if (shouldRefreshCodeBuddyAfterFailure(error, selection, options)) {
+      try {
+        const refreshed = await refreshCodeBuddySelectedAccount(selection, {
+          force: true,
+          fetchImpl: options.fetchImpl,
+          signal: options.signal,
+        });
+        if (refreshed?.refreshedCodeBuddyToken) {
+          log("info", "retrying codebuddy request after oauth refresh", {
+            accountId: refreshed.account?.id || selection.account?.id || "",
+          });
+          return await runCodeBuddyCompletionFromPool(messages, {
+            ...options,
+            accountId: refreshed.account?.id || selection.account?.id || options.accountId,
+            _codeBuddyRefreshRetry: true,
+          });
+        }
+      } catch (refreshError) {
+        error = refreshError;
+      }
+    }
     markCodeBuddyAccountResult(selection, false, {
       accountsPath: config.codeBuddyAccountsPath,
       error: error instanceof Error ? error.message : String(error),
@@ -912,6 +1581,10 @@ function normalizeCodeBuddyLoginStatus(value = {}) {
     authenticated,
     loggedIn: authenticated,
     accessAllowed,
+    userId: compactText(source.userId || source.user_id || source.id || ""),
+    userName: compactText(source.userName || source.username || source.email || source.name || ""),
+    userNickname: compactText(source.userNickname || source.nickname || source.displayName || ""),
+    authMode: compactText(source.authMode || source.auth_mode || source.mode || ""),
     message: compactText(source.message || source.statusMessage || source.error || source.note || ""),
     raw: {
       authEnabled,
@@ -1047,70 +1720,439 @@ function normalizeCodeBuddySessionUrl(value, options = {}) {
   return buildCodeBuddyOAuthLaunchUrl(options);
 }
 
-function normalizeCodeBuddyExternalLoginUrl(value) {
-  const url = normalizeCodeBuddyLoginUrl(value);
-  if (!url || isCodeBuddyOAuthLaunchUrl(url)) return "";
-  return url;
+function sanitizeCodeBuddyCookieHeader(value) {
+  let text = String(value || "").trim();
+  text = text.replace(/^\s*(?:-H|--header)\s+/i, "").trim();
+  text = text.replace(/^['"]|['"]$/g, "").trim();
+  text = text.replace(/^Cookie\s*:\s*/i, "").trim();
+  text = text.replace(/\\\s*$/g, "").trim();
+  text = text.replace(/^['"]|['"]$/g, "").trim();
+  text = text.replace(/['"]\s*$/g, "").trim();
+  const cookies = parseCookieHeader(text);
+  if (cookies.size === 0) return "";
+  cookies.delete("cursor_codebuddy_oauth");
+  for (const attr of ["path", "expires", "max-age", "domain", "samesite", "secure", "httponly"]) {
+    cookies.delete(attr);
+    cookies.delete(attr.toUpperCase());
+    cookies.delete(attr.replace(/(^|-)([a-z])/g, (_m, prefix, char) => `${prefix}${char.toUpperCase()}`));
+  }
+  return Array.from(cookies.entries())
+    .filter(([key]) => key)
+    .map(([key, val]) => `${key}=${val}`)
+    .join("; ");
 }
 
-function findCodeBuddyLoginUrl(value, seen = new Set()) {
-  if (!value || typeof value !== "object" || seen.has(value)) return "";
-  seen.add(value);
-  for (const key of ["loginUrl", "authUrl", "authorizationUrl", "authorizeUrl", "redirectUrl", "verificationUriComplete", "verificationUrl", "url"]) {
-    const url = normalizeCodeBuddyLoginUrl(value[key]);
-    if (url) return url;
+function looksLikeCookieHeader(value) {
+  const text = compactText(value);
+  return /^[A-Za-z0-9_.-]+=[^;]+(?:;\s*[A-Za-z0-9_.-]+=[^;]+)*$/.test(text);
+}
+
+function parseCodeBuddyGatewayCredentialInput(value = "", options = {}) {
+  const text = compactText(value);
+  const result = {
+    ok: false,
+    source: "",
+    raw: text,
+    baseUrl: "",
+    authToken: "",
+    tokenData: null,
+    cookie: "",
+  };
+
+  const cookieFromOptions = sanitizeCodeBuddyCookieHeader(options.cookieHeader || "");
+  if (cookieFromOptions) {
+    result.cookie = cookieFromOptions;
+    result.source = "browser_cookie";
   }
-  for (const [key, entry] of Object.entries(value)) {
-    if (/token|secret|password|api[_-]?key|base[_-]?url|endpoint|host|origin/i.test(key)) continue;
-    if (typeof entry === "string") {
-      const url = normalizeCodeBuddyLoginUrl(entry);
-      if (url) return url;
+
+  if (!text) {
+    result.ok = Boolean(result.cookie);
+    return result;
+  }
+
+  if (/^[{[]/.test(text)) {
+    try {
+      const parsed = JSON.parse(text);
+      const collected = collectCodeBuddyCredentialFields(parsed, {}, new Set());
+      if (collected.bearerToken) {
+        result.authToken = collected.bearerToken;
+        result.tokenData = {
+          bearerToken: collected.bearerToken,
+          refreshToken: collected.refreshToken || "",
+          expiresIn: Number(collected.expiresIn || 0),
+          tokenType: collected.tokenType || "Bearer",
+          sessionState: collected.sessionState || "",
+          scope: collected.scope || "",
+          userId: collected.userId || "",
+        };
+        result.source = "json_token";
+        result.ok = true;
+        return result;
+      }
+    } catch {
+      // Fall through to URL/bearer/plain-token parsing.
     }
-    if (entry && typeof entry === "object") {
-      const nested = findCodeBuddyLoginUrl(entry, seen);
-      if (nested) return nested;
+  }
+
+  const loosePassword = text.match(/^\??(?:password|token|auth|access_token)=([^&\s]+)/i);
+  if (loosePassword) {
+    result.authToken = decodeURIComponent(loosePassword[1]);
+    result.source = "password_param";
+    result.ok = Boolean(result.authToken || result.cookie);
+    return result;
+  }
+
+  if (looksLikeCookieHeader(text)) {
+    result.cookie = sanitizeCodeBuddyCookieHeader(text);
+    result.source = result.source || "cookie";
+    result.ok = Boolean(result.cookie);
+    return result;
+  }
+
+  const bearer = text.match(/^Bearer\s+(.+)$/i);
+  if (bearer) {
+    result.authToken = compactText(bearer[1]);
+    result.source = "bearer";
+    result.ok = Boolean(result.authToken || result.cookie);
+    return result;
+  }
+
+  try {
+    const parsed = new URL(text, "http://localhost");
+    const password = compactText(
+      parsed.searchParams.get("password") ||
+      parsed.searchParams.get("token") ||
+      parsed.searchParams.get("auth") ||
+      parsed.searchParams.get("access_token") ||
+      "",
+    );
+    const cookie = compactText(parsed.searchParams.get("cookie") || "");
+    if (password) result.authToken = password;
+    if (cookie) result.cookie = sanitizeCodeBuddyCookieHeader(cookie) || cookie;
+    if (/^https?:\/\//i.test(text) && !parsed.pathname.startsWith("/direct-admin/")) {
+      result.baseUrl = parsed.origin;
     }
+    result.source = result.authToken ? "url_password" : (result.cookie ? "url_cookie" : "url");
+    result.ok = Boolean(result.authToken || result.cookie || result.baseUrl);
+    return result;
+  } catch {
+    // Plain gateway password/token.
+  }
+
+  result.authToken = text;
+  result.source = "token";
+  result.ok = Boolean(result.authToken || result.cookie);
+  return result;
+}
+
+function createCodeBuddyCredentialHeaders(credential = {}, options = {}) {
+  const headers = createCodeBuddyHeaders({
+    token: compactText(credential.authToken || options.authToken || options.token || ""),
+    exemptRequestHeader: true,
+  });
+  const cookie = sanitizeCodeBuddyCookieHeader(credential.cookie || options.cookieHeader || options.cookie || "");
+  if (cookie) headers.cookie = cookie;
+  return headers;
+}
+
+function firstCodeBuddyCredentialText(...values) {
+  for (const value of values) {
+    const text = compactText(value);
+    if (text) return text;
   }
   return "";
 }
 
-function summarizeCodeBuddyLoginResponse(value = {}) {
-  const source = value && typeof value === "object" ? value : {};
+function looksLikeStructuredCodeBuddyCredentialText(value) {
+  const text = compactText(value);
+  if (!text) return false;
+  if (/^[{[]/.test(text)) return true;
+  return /(?:^|\n|\s)(?:CODEBUDDY_API_KEY|API_KEY|api_key|apiKey|x-api-key|CODEBUDDY_SITE|site|CURSOR_DIRECT_CODEBUDDY_API_ENDPOINT|CODEBUDDY_API_ENDPOINT|apiEndpoint|api_endpoint)\s*[:=]/i.test(text);
+}
+
+function stripWrappedSecret(value) {
+  return compactText(value).replace(/^['"]|['"]$/g, "");
+}
+
+function looksLikeCodeBuddySecretValue(value) {
+  const text = stripWrappedSecret(value);
+  if (!text) return false;
+  if (/^\d{10,}$/.test(text)) return false;
+  if (/^[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}$/i.test(text)) return false;
+  if (text.length < 16) return false;
+  if (/^eyJ[A-Za-z0-9_-]*\./.test(text)) return true;
+  return /[A-Za-z]/.test(text) && /[A-Za-z0-9]/.test(text);
+}
+
+function parseCodeBuddyCredentialEnvText(text = {}) {
+  const raw = String(text || "");
+  const result = {
+    apiKey: "",
+    baseUrl: "",
+    apiEndpoint: "",
+    chatCompletionsPath: "",
+    internetEnvironment: "",
+  };
+  const read = (pattern) => {
+    const match = raw.match(pattern);
+    return match ? stripWrappedSecret(match[1] || "") : "";
+  };
+
+  result.apiKey = read(/(?:^|\n|\s)(?:CODEBUDDY_API_KEY|API_KEY|api_key|apiKey|x-api-key)\s*[:=]\s*["']?([^\s"',;]+)/i);
+  result.site = read(/(?:^|\n|\s)(?:CURSOR_DIRECT_CODEBUDDY_SITE|CODEBUDDY_SITE|site)\s*[:=]\s*["']?([^\s"',;]+)/i);
+  result.baseUrl = read(/(?:^|\n|\s)(?:CODEBUDDY_BASE_URL|baseUrl|base_url)\s*[:=]\s*["']?([^\s"',;]+)/i);
+  result.apiEndpoint = read(/(?:^|\n|\s)(?:CURSOR_DIRECT_CODEBUDDY_API_ENDPOINT|CODEBUDDY_API_ENDPOINT|apiEndpoint|api_endpoint)\s*[:=]\s*["']?([^\s"',;]+)/i);
+  result.chatCompletionsPath = read(/(?:^|\n|\s)(?:CURSOR_DIRECT_CODEBUDDY_CHAT_COMPLETIONS_PATH|CODEBUDDY_CHAT_COMPLETIONS_PATH|chatCompletionsPath|chat_completions_path|endpointPath|endpoint_path)\s*[:=]\s*["']?([^\s"',;]+)/i);
+  result.internetEnvironment = read(/(?:^|\n|\s)(?:CURSOR_DIRECT_CODEBUDDY_INTERNET_ENVIRONMENT|CODEBUDDY_INTERNET_ENVIRONMENT|internetEnvironment|internet_environment)\s*[:=]\s*["']?([^\s"',;]+)/i);
+
+  const apiHeader = raw.match(/(?:x-api-key|X-API-Key)\s*[:=]\s*["']?([^\s"',;]+)/);
+  if (!result.apiKey && apiHeader) result.apiKey = stripWrappedSecret(apiHeader[1]);
+
+  return result;
+}
+
+function shouldUseCodeBuddyCredentialBaseUrl(value) {
+  const text = compactText(value);
+  if (!text) return false;
+  try {
+    const parsed = new URL(text);
+    const host = parsed.hostname.toLowerCase();
+    if (host === "codebuddy.ai" || host.endsWith(".codebuddy.ai")) return false;
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function collectCodeBuddyCredentialFields(value, out = {}, seen = new Set()) {
+  if (!value || typeof value !== "object" || seen.has(value)) return out;
+  seen.add(value);
+  for (const [key, entry] of Object.entries(value)) {
+    const normalizedKey = key.replace(/[-_\s]/g, "").toLowerCase();
+    if (typeof entry === "string" || typeof entry === "number") {
+      const text = compactText(entry);
+      if (!text) continue;
+      if (["apikey", "codebuddyapikey", "xapikey", "x-apikey", "key"].includes(normalizedKey)) {
+        out.apiKey ||= text;
+      } else if (["bearertoken", "bearer", "accesstoken", "access_token", "authtoken", "auth_token"].includes(normalizedKey)) {
+        out.bearerToken ||= text;
+      } else if (["userid", "uid"].includes(normalizedKey)) {
+        out.userId ||= text;
+      } else if (["createdat"].includes(normalizedKey)) {
+        out.createdAt ||= Number(text) || 0;
+      } else if (["expiresin"].includes(normalizedKey)) {
+        out.expiresIn ||= Number(text) || 0;
+      } else if (["refreshtoken"].includes(normalizedKey)) {
+        out.refreshToken ||= text;
+      } else if (["tokentype"].includes(normalizedKey)) {
+        out.tokenType ||= text;
+      } else if (["sessionstate"].includes(normalizedKey)) {
+        out.sessionState ||= text;
+      } else if (["scope"].includes(normalizedKey)) {
+        out.scope ||= text;
+      } else if (["baseurl"].includes(normalizedKey) && shouldUseCodeBuddyCredentialBaseUrl(text)) {
+        out.baseUrl ||= text;
+      } else if (["apiendpoint", "codebuddyapiendpoint", "chatendpoint", "endpoint"].includes(normalizedKey)) {
+        out.apiEndpoint ||= text;
+      } else if (["chatcompletionspath", "codebuddychatcompletionspath", "endpointpath"].includes(normalizedKey)) {
+        out.chatCompletionsPath ||= text;
+      } else if (["internetenvironment", "codebuddyinternetenvironment"].includes(normalizedKey)) {
+        out.internetEnvironment ||= text;
+      } else if (["site", "region", "codebuddysite", "codebuddyregion"].includes(normalizedKey)) {
+        out.site ||= text;
+      } else if (["weborigin", "weburl", "origin", "url"].includes(normalizedKey)) {
+        out.webOrigin ||= text;
+      } else if (["label", "name", "email", "username"].includes(normalizedKey)) {
+        out.label ||= text;
+      }
+      continue;
+    }
+    if (entry && typeof entry === "object") collectCodeBuddyCredentialFields(entry, out, seen);
+  }
+  return out;
+}
+
+function normalizeCodeBuddyImportSite(value) {
+  const text = compactText(value).toLowerCase();
+  if (["domestic", "cn", "china", "internal"].includes(text)) return "domestic";
+  return "global";
+}
+
+function getCodeBuddyImportBaseUrl(site) {
+  return normalizeCodeBuddyImportSite(site) === "domestic"
+    ? "https://www.codebuddy.cn"
+    : "https://www.codebuddy.ai";
+}
+
+function createCodeBuddyAccountFromCredential(input = {}, options = {}) {
+  const source = input && typeof input === "object" ? input : {};
+  const collected = collectCodeBuddyCredentialFields(source, {}, new Set());
+  const site = normalizeCodeBuddyImportSite(
+    source.site || source.codeBuddySite || source.codebuddy_site || collected.site || options.site,
+  );
+  const baseUrl = normalizeCodeBuddyBaseUrl(
+    source.baseUrl || collected.baseUrl || options.baseUrl || getCodeBuddyImportBaseUrl(site) || config.codeBuddyBaseUrl,
+  );
+  const apiEndpoint = compactText(
+    source.apiEndpoint || source.api_endpoint || source.endpoint || collected.apiEndpoint || options.apiEndpoint || "",
+  );
+  const chatCompletionsPath = compactText(
+    source.chatCompletionsPath ||
+    source.chat_completions_path ||
+    source.endpointPath ||
+    source.endpoint_path ||
+    collected.chatCompletionsPath ||
+    options.chatCompletionsPath ||
+    "",
+  );
+  const internetEnvironment = compactText(
+    source.internetEnvironment || source.internet_environment || collected.internetEnvironment || options.internetEnvironment || "",
+  );
+  const bearerToken = compactText(
+    source.bearerToken ||
+    source.bearer_token ||
+    source.accessToken ||
+    source.access_token ||
+    collected.bearerToken ||
+    "",
+  );
+  const apiKey = compactText(source.apiKey || source.api_key || collected.apiKey || "");
+  const userId = compactText(source.user_id || source.userId || collected.userId || "");
+  const userInfo = source.user_info && typeof source.user_info === "object" ? source.user_info : {};
+  const createdAt = Number(source.created_at || source.createdAt || collected.createdAt || 0);
+  const expiresIn = Number(source.expires_in || source.expiresIn || collected.expiresIn || 0);
+  const refreshToken = compactText(source.refreshToken || source.refresh_token || collected.refreshToken || "");
+  if (!bearerToken && !apiKey) {
+    return null;
+  }
+  const label = compactText(
+    source.label || collected.label || options.label || userId || userInfo.name || userInfo.email || "CodeBuddy Account",
+  );
   return {
-    success: Boolean(source.success === true || source.ok === true || source.data?.success === true),
-    message: compactText(source.message || source.error || source.data?.message || source.data?.error || ""),
-    url: findCodeBuddyLoginUrl(source) || "",
+    label,
+    site,
+    baseUrl,
+    apiEndpoint,
+    chatCompletionsPath,
+    internetEnvironment,
+    source: bearerToken ? "cli_credential" : "manual",
+    transport: compactText(source.transport || options.transport || "") || (bearerToken ? "protocol_direct" : "cloud"),
+    daemonBaseUrl: config.codeBuddyServeUrl,
+    bearer_token: bearerToken,
+    refresh_token: refreshToken,
+    apiKey: bearerToken ? "" : apiKey,
+    user_id: userId,
+    created_at: createdAt,
+    expires_in: expiresIn,
+    user_info: userInfo,
+    authStatus: {
+      userId,
+      userName: compactText(userInfo.name || userInfo.email || source.user_name || ""),
+      userNickname: compactText(userInfo.nickname || ""),
+      loggedIn: true,
+      authenticated: true,
+      authMode: bearerToken ? "cli_bearer" : "api_key",
+    },
   };
 }
 
+function normalizeCodeBuddyCredentialImportRequest(body = {}) {
+  const source = body && typeof body === "object" ? body : {};
+  if (Array.isArray(source.accounts)) return source;
+  if (source.account && typeof source.account === "object") return { accounts: [source.account] };
+
+  const label = compactText(source.label || source.accountLabel || "CodeBuddy Account");
+  const site = normalizeCodeBuddyImportSite(source.site || source.codeBuddySite || source.codebuddy_site);
+  const baseUrl = normalizeCodeBuddyBaseUrl(source.baseUrl || getCodeBuddyImportBaseUrl(site) || config.codeBuddyBaseUrl);
+  const apiEndpoint = compactText(source.apiEndpoint || source.api_endpoint || source.endpoint || "");
+  const chatCompletionsPath = compactText(source.chatCompletionsPath || source.chat_completions_path || source.endpointPath || source.endpoint_path || "");
+  const internetEnvironment = compactText(source.internetEnvironment || source.internet_environment || "");
+  const text = firstCodeBuddyCredentialText(
+    source.credentialText,
+    source.credential,
+    source.authJson,
+    source.raw,
+    source.text,
+    source.token,
+    source.apiKey,
+  );
+  const textLooksStructured = looksLikeStructuredCodeBuddyCredentialText(text);
+  const accounts = [];
+  const add = (candidate) => {
+    const account = createCodeBuddyAccountFromCredential(candidate, {
+      label,
+      site,
+      baseUrl,
+      apiEndpoint,
+      chatCompletionsPath,
+      internetEnvironment,
+    });
+    if (account) accounts.push(account);
+  };
+
+  const rawApiKeyCandidate = compactText(source.apiKey || source.api_key || source["x-api-key"] || source.key || "");
+  const apiKeyCandidate = looksLikeStructuredCodeBuddyCredentialText(rawApiKeyCandidate) ? "" : rawApiKeyCandidate;
+  if (apiKeyCandidate) add({ label, site, baseUrl, apiEndpoint, chatCompletionsPath, internetEnvironment, apiKey: apiKeyCandidate });
+
+  if (text) {
+    let parsedJson = null;
+    try {
+      parsedJson = JSON.parse(text);
+    } catch {
+      parsedJson = null;
+    }
+    if (parsedJson) {
+      if (Array.isArray(parsedJson)) {
+        for (const item of parsedJson) add(collectCodeBuddyCredentialFields(item, { label, site, baseUrl, apiEndpoint, chatCompletionsPath, internetEnvironment }));
+      } else if (Array.isArray(parsedJson.accounts)) {
+        for (const item of parsedJson.accounts) add(collectCodeBuddyCredentialFields(item, { label, site, baseUrl, apiEndpoint, chatCompletionsPath, internetEnvironment }));
+      } else {
+        add(collectCodeBuddyCredentialFields(parsedJson, { label, site, baseUrl, apiEndpoint, chatCompletionsPath, internetEnvironment }));
+      }
+    }
+    const envFields = parseCodeBuddyCredentialEnvText(text);
+    add({ label, site, baseUrl, apiEndpoint, chatCompletionsPath, internetEnvironment, ...envFields });
+    if (!parsedJson && !textLooksStructured) {
+      add({ label, site, baseUrl, apiEndpoint, chatCompletionsPath, internetEnvironment, apiKey: text });
+    }
+  }
+
+  const unique = [];
+  const seen = new Set();
+  for (const account of accounts) {
+    const credentialKey = account.bearer_token
+      ? `bearer:${createHash("sha256").update(account.bearer_token).digest("hex").slice(0, 16)}`
+      : `apikey:${account.apiKey || ""}`;
+    const key = [credentialKey, account.baseUrl, account.apiEndpoint, account.chatCompletionsPath].join("|");
+    if (seen.has(key)) continue;
+    seen.add(key);
+    unique.push(account);
+  }
+
+  return { accounts: unique };
+}
+
 function buildCodeBuddyOAuthSessionResponse(options = {}) {
-  const launchUrl = buildCodeBuddyOAuthLaunchUrl({
+  const gatewayLaunchUrl = buildCodeBuddyOAuthLaunchUrl({
     publicOrigin: options.publicOrigin,
     id: codeBuddyOAuthSession.id,
     token: codeBuddyOAuthSession.token,
   });
-  const sessionUrl = normalizeCodeBuddySessionUrl(codeBuddyOAuthSession.url || launchUrl, {
-    publicOrigin: options.publicOrigin,
-    id: codeBuddyOAuthSession.id,
-    token: codeBuddyOAuthSession.token,
-  }) || launchUrl;
+  const sessionUrl = compactText(codeBuddyOAuthSession.url || codeBuddyOAuthSession.login?.url || "");
   const login = codeBuddyOAuthSession.login && typeof codeBuddyOAuthSession.login === "object"
     ? {
       success: Boolean(codeBuddyOAuthSession.login.success),
       message: compactText(codeBuddyOAuthSession.login.message || ""),
-      url: normalizeCodeBuddySessionUrl(codeBuddyOAuthSession.login.url || sessionUrl, {
-        publicOrigin: options.publicOrigin,
-        id: codeBuddyOAuthSession.id,
-        token: codeBuddyOAuthSession.token,
-      }),
+      url: compactText(codeBuddyOAuthSession.login.url || sessionUrl),
     }
     : null;
   return {
     id: codeBuddyOAuthSession.id,
     provider: codeBuddyOAuthSession.provider,
     status: codeBuddyOAuthSession.status,
-    url: launchUrl || sessionUrl,
-    launchUrl: launchUrl || sessionUrl,
+    url: sessionUrl,
+    launchUrl: gatewayLaunchUrl,
+    gatewayLaunchUrl,
     accessUrl: codeBuddyOAuthSession.accessUrl || buildCodeBuddyRemoteUrl({ publicOrigin: options.publicOrigin }),
     callbackUrl: codeBuddyOAuthSession.callbackUrl,
     startedAt: codeBuddyOAuthSession.startedAt,
@@ -1121,7 +2163,10 @@ function buildCodeBuddyOAuthSessionResponse(options = {}) {
     authStatus: codeBuddyOAuthSession.authStatus,
     login,
     label: codeBuddyOAuthSession.label,
-    running: false,
+    site: codeBuddyOAuthSession.site || "global",
+    authState: codeBuddyOAuthSession.authState || "",
+    externalAuthUrl: sessionUrl,
+    running: codeBuddyOAuthSession.status === "waiting",
     authenticated: Boolean(options.authenticated ?? (codeBuddyOAuthSession.status === "complete")),
   };
 }
@@ -1142,21 +2187,38 @@ function buildCodeBuddyOAuthLaunchPage(message, options = {}) {
     id: codeBuddyOAuthSession.id,
     token: codeBuddyOAuthSession.token,
   });
+  const notifyScript = options.notifyAdmin
+    ? [
+      "  <script>",
+      "    (function () {",
+      "      try {",
+      "        if (window.opener && !window.opener.closed) {",
+      "          window.opener.postMessage({ type: 'codebuddy-oauth-complete', ok: " + (options.success ? "true" : "false") + " }, '*');",
+      "        }",
+      "      } catch (_) {}",
+      "      setTimeout(function () { window.location.href = '/direct-admin/#codebuddy'; }, 1800);",
+      "    })();",
+      "  </script>",
+    ].join("\n")
+    : "";
   const body = [
     "<!doctype html>",
     '<html lang="zh-CN">',
     "<head>",
     '  <meta charset="utf-8" />',
     '  <meta name="viewport" content="width=device-width, initial-scale=1" />',
-    "  <title>CodeBuddy OAuth</title>",
+    "  <title>CodeBuddy Gateway Login</title>",
     "  <style>body{font-family:system-ui,sans-serif;max-width:720px;margin:48px auto;padding:0 20px;line-height:1.6;color:#111}a,button{display:inline-block;margin-top:12px;padding:10px 14px;border-radius:8px;border:1px solid #111;text-decoration:none;color:#fff;background:#111}p{white-space:pre-wrap} .muted{color:#666}</style>",
     "</head>",
     "<body>",
-    "  <h1>CodeBuddy OAuth</h1>",
+    "  <h1>CodeBuddy Gateway Login</h1>",
     `  <p>${escapeHtmlText(message || "")}</p>`,
     launchUrl ? `  <p class="muted">登录入口：<a href="${escapeHtmlText(launchUrl)}">${escapeHtmlText(launchUrl)}</a></p>` : "",
-    `  <p class="muted">授权完成后回到管理台，粘贴最终回调地址或直接点击检查。</p>`,
+    options.notifyAdmin
+      ? "  <p class=\"muted\">正在同步凭证到网关，稍后将自动返回管理台…</p>"
+      : "  <p class=\"muted\">登录完成后回到管理台，系统会自动检测；也可手动点击「检查登录」。</p>",
     `  <p><a href="/direct-admin/#codebuddy">返回管理台</a></p>`,
+    notifyScript,
     "</body>",
     "</html>",
   ].filter(Boolean).join("\n");
@@ -1171,28 +2233,45 @@ function createCodeBuddyDaemonAccount(authStatus, options = {}) {
   const baseUrl = normalizeCodeBuddyBaseUrl(options.baseUrl || config.codeBuddyBaseUrl);
   const normalizedAuthStatus = normalizeCodeBuddyLoginStatus(authStatus);
   const confirmed = Boolean(options.confirmed);
+  const authToken = compactText(options.authToken || "");
+  const cookie = sanitizeCodeBuddyCookieHeader(options.cookie || "");
+  const authType = authToken ? "auth_token" : (cookie ? "cookie" : "daemon");
   return {
-    id: getCodeBuddyDaemonAccountId(baseUrl),
-    label: compactText(options.label || "CodeBuddy OAuth"),
-    source: "oauth",
+    id: authToken || cookie
+      ? createHash("sha256").update(`${baseUrl}|${authToken || cookie}`).digest("hex").slice(0, 16)
+      : getCodeBuddyDaemonAccountId(baseUrl),
+    label: compactText(options.label || "CodeBuddy Gateway"),
+    source: "gateway",
     baseUrl,
-    authType: "daemon",
-    useDaemonAuth: true,
+    authType,
+    useDaemonAuth: !authToken && !cookie,
+    authToken,
+    cookie,
     enabled: true,
     authStatus: {
       ...normalizedAuthStatus,
       loggedIn: confirmed || Boolean(normalizedAuthStatus.loggedIn),
       authenticated: confirmed || Boolean(normalizedAuthStatus.authenticated),
       accessAllowed: Boolean(normalizedAuthStatus.accessAllowed),
-      authMode: confirmed ? "daemon_oauth" : normalizedAuthStatus.raw?.authMode || "daemon",
+      authMode: confirmed ? (normalizedAuthStatus.authMode || authType || "gateway") : normalizedAuthStatus.raw?.authMode || "daemon",
       confirmedAt: confirmed ? Date.now() : 0,
     },
   };
 }
 
-async function fetchCodeBuddyAuthStatus() {
-  const response = await fetch(`${normalizeCodeBuddyBaseUrl(config.codeBuddyBaseUrl)}/api/v1/auth/status`, {
-    headers: createCodeBuddyHeaders({ exemptRequestHeader: true }),
+async function fetchCodeBuddyAuthStatus(options = {}) {
+  const credential = options.credential && typeof options.credential === "object"
+    ? options.credential
+    : {
+      authToken: options.authToken || options.token || "",
+      cookie: options.cookie || options.cookieHeader || "",
+    };
+  const baseUrl = normalizeCodeBuddyBaseUrl(credential.baseUrl || options.baseUrl || config.codeBuddyBaseUrl);
+  const response = await fetch(`${baseUrl}/api/v1/auth/status`, {
+    headers: createCodeBuddyCredentialHeaders(credential, {
+      token: options.token,
+      cookieHeader: options.cookieHeader,
+    }),
   });
   const text = await response.text();
   let data = {};
@@ -1207,26 +2286,7 @@ async function fetchCodeBuddyAuthStatus() {
   return normalizeCodeBuddyLoginStatus(data);
 }
 
-async function triggerCodeBuddyAuthLogin() {
-  const response = await fetch(`${normalizeCodeBuddyBaseUrl(config.codeBuddyBaseUrl)}/api/v1/auth/login`, {
-    method: "POST",
-    headers: createCodeBuddyHeaders({ exemptRequestHeader: true }),
-    body: "{}",
-  });
-  const text = await response.text();
-  let data = {};
-  try {
-    data = text ? JSON.parse(text) : {};
-  } catch {
-    data = {};
-  }
-  if (!response.ok) {
-    throw new Error(`CodeBuddy auth/login failed with ${response.status}`);
-  }
-  return summarizeCodeBuddyLoginResponse(data);
-}
-
-function importCodeBuddyDaemonAccount(authStatus, options = {}) {
+function importCodeBuddyGatewayAccount(authStatus, options = {}) {
   const account = createCodeBuddyDaemonAccount(authStatus, options);
   const result = importCodeBuddyAccounts(readCodeBuddyStore(), { accounts: [account] });
   const store = writeCodeBuddyStore(result.store);
@@ -1260,20 +2320,13 @@ async function getCodeBuddyOAuthSessionPayload(options = {}) {
       },
     };
   }
-  let authStatus = null;
-  try {
-    authStatus = await fetchCodeBuddyAuthStatus();
-    codeBuddyOAuthSession.authStatus = authStatus;
-  } catch (error) {
-    codeBuddyOAuthSession.error = error instanceof Error ? error.message : String(error);
-  }
   const accounts = summarizeCodeBuddyStore(readCodeBuddyStore());
   const payload = {
     ok: true,
     provider: "codebuddy",
     session: buildCodeBuddyOAuthSessionResponse({
       publicOrigin: options.publicOrigin,
-      authenticated: Boolean(authStatus?.authenticated),
+      authenticated: Boolean(accounts.primary?.hasCredentials),
     }),
     accounts,
     account: accounts.primary,
@@ -1281,15 +2334,190 @@ async function getCodeBuddyOAuthSessionPayload(options = {}) {
   return setMetadataCache(metadataCaches.codeBuddyOAuthSession, payload, { now, ttlMs: config.oauthSessionCacheTtlMs });
 }
 
+function importCodeBuddyOAuthAccount(tokenData = {}, options = {}) {
+  const accountInput = buildCodeBuddyCliCredentialFromTokenData(tokenData, {
+    label: options.label || codeBuddyOAuthSession.label,
+    site: options.site || codeBuddyOAuthSession.site || "global",
+  });
+  accountInput.transport = config.codeBuddyTransportConfigured
+    ? config.codeBuddyTransport
+    : "protocol_direct";
+  accountInput.daemonBaseUrl = config.codeBuddyServeUrl;
+  writeCodeBuddyLocalCredential(accountInput);
+  const result = importCodeBuddyAccounts(readCodeBuddyStore(), accountInput, {
+    accountsPath: config.codeBuddyAccountsPath,
+  });
+  const store = writeCodeBuddyStore(result.store);
+  return {
+    imported: result.imported,
+    summaries: result.summaries,
+    account: summarizeCodeBuddyAccount(result.imported[0] || accountInput),
+    accounts: summarizeCodeBuddyStore(store),
+  };
+}
+
+function finishCodeBuddyOAuthImport(imported, options = {}) {
+  codeBuddyOAuthSession.status = "complete";
+  codeBuddyOAuthSession.completedAt = Date.now();
+  codeBuddyOAuthSession.confirmedAt ||= codeBuddyOAuthSession.completedAt;
+  codeBuddyOAuthSession.updatedAt = codeBuddyOAuthSession.completedAt;
+  codeBuddyOAuthSession.error = "";
+  codeBuddyOAuthSession.authStatus = imported.account?.authStatus || null;
+  clearCodeBuddyOAuthSessionPersistence();
+  clearMetadataCache(metadataCaches.codeBuddyOAuthSession);
+  return {
+    ok: true,
+    provider: "codebuddy",
+    status: "complete",
+    message: options.message || "CodeBuddy OAuth login completed and account imported.",
+    session: buildCodeBuddyOAuthSessionResponse({
+      publicOrigin: options.publicOrigin,
+      authenticated: true,
+    }),
+    imported: imported.summaries,
+    account: imported.account,
+    accounts: imported.accounts,
+  };
+}
+
+function isImportableCodeBuddyBearerToken(value = "") {
+  return /^eyJ[A-Za-z0-9_-]*\./.test(compactText(value));
+}
+
+function importCodeBuddyManualBearerCredential(authToken = "", options = {}) {
+  const tokenData = authToken && typeof authToken === "object"
+    ? authToken
+    : { bearerToken: authToken };
+  const bearerToken = compactText(
+    tokenData.bearerToken || tokenData.accessToken || tokenData.access_token || tokenData.bearer_token || "",
+  );
+  if (!isImportableCodeBuddyBearerToken(bearerToken)) return null;
+  const site = options.site || codeBuddyOAuthSession.site || "global";
+  const baseUrl = normalizeCodeBuddyBaseUrl(options.baseUrl || getCodeBuddyImportBaseUrl(site) || config.codeBuddyBaseUrl);
+  const credential = buildCodeBuddyCliCredentialFromTokenData(
+    { ...tokenData, bearerToken },
+    { label: options.label || codeBuddyOAuthSession.label || "CodeBuddy OAuth", site },
+  );
+  const accountInput = createCodeBuddyAccountFromCredential(credential, {
+    label: credential.label,
+    site,
+    baseUrl,
+  });
+  if (!accountInput) {
+    throw new Error("CodeBuddy manual OAuth input did not produce a usable credential");
+  }
+  const writeResult = writeCodeBuddyLocalCredential(credential);
+  if (!writeResult.ok) {
+    throw new Error(writeResult.error || "Failed to write local CodeBuddy credential");
+  }
+  const result = importCodeBuddyAccounts(readCodeBuddyStore(), accountInput, {
+    accountsPath: config.codeBuddyAccountsPath,
+  });
+  const store = writeCodeBuddyStore(result.store);
+  return {
+    imported: result.imported,
+    summaries: result.summaries,
+    account: summarizeCodeBuddyAccount(result.imported[0] || accountInput),
+    accounts: summarizeCodeBuddyStore(store),
+  };
+}
+
+function sleepMs(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+async function pollCodeBuddyOAuthSession(options = {}) {
+  applyCodeBuddyOAuthSessionHints(options);
+  const authState = compactText(options.authState || codeBuddyOAuthSession.authState);
+  if (!authState) {
+    return {
+      ok: false,
+      provider: "codebuddy",
+      status: "error",
+      message: "OAuth session has no auth state (gateway may have restarted). Click「开始 OAuth 登录」again.",
+      session: buildCodeBuddyOAuthSessionResponse({ publicOrigin: options.publicOrigin }),
+    };
+  }
+  const site = options.site || codeBuddyOAuthSession.site || "global";
+  const maxAttempts = Math.max(1, Math.min(Number(options.maxAttempts) || 1, 25));
+  const intervalMs = Math.max(800, Number(options.intervalMs) || 2000);
+  let poll = null;
+  for (let attempt = 0; attempt < maxAttempts; attempt += 1) {
+    poll = await pollCodeBuddyPluginAuth({
+      authState,
+      site,
+      baseUrl: options.baseUrl,
+    });
+    if (poll.status === "success" && poll.tokenData) break;
+    if (poll.status === "pending" && attempt < maxAttempts - 1) {
+      await sleepMs(intervalMs);
+      continue;
+    }
+    break;
+  }
+  if (poll.status === "pending") {
+    codeBuddyOAuthSession.status = "waiting";
+    codeBuddyOAuthSession.error = "";
+    codeBuddyOAuthSession.updatedAt = Date.now();
+    persistCodeBuddyOAuthSession();
+    clearMetadataCache(metadataCaches.codeBuddyOAuthSession);
+    const accounts = summarizeCodeBuddyStore(readCodeBuddyStore());
+    return {
+      ok: false,
+      pending: true,
+      provider: "codebuddy",
+      status: "pending",
+      message: maxAttempts > 1
+        ? `${poll.message || "waiting for login"}（已轮询 ${maxAttempts} 次；CodeBuddy 页面显示登录成功后通常还需几秒）`
+        : (poll.message || "waiting for login"),
+      pollAttempts: maxAttempts,
+      session: buildCodeBuddyOAuthSessionResponse({ publicOrigin: options.publicOrigin }),
+      accounts,
+      account: accounts.primary,
+    };
+  }
+  if (poll.status !== "success" || !poll.tokenData) {
+    codeBuddyOAuthSession.status = "failed";
+    const detail = poll.code != null ? ` (upstream code ${poll.code})` : "";
+    codeBuddyOAuthSession.error = `${poll.message || "CodeBuddy OAuth poll failed"}${detail}`;
+    codeBuddyOAuthSession.updatedAt = Date.now();
+    persistCodeBuddyOAuthSession();
+    clearMetadataCache(metadataCaches.codeBuddyOAuthSession);
+    const accounts = summarizeCodeBuddyStore(readCodeBuddyStore());
+    return {
+      ok: false,
+      provider: "codebuddy",
+      status: poll.status || "error",
+      message: codeBuddyOAuthSession.error,
+      upstreamCode: poll.code,
+      session: buildCodeBuddyOAuthSessionResponse({ publicOrigin: options.publicOrigin }),
+      accounts,
+      account: accounts.primary,
+    };
+  }
+  const imported = importCodeBuddyOAuthAccount(poll.tokenData, options);
+  return finishCodeBuddyOAuthImport(imported, {
+    publicOrigin: options.publicOrigin,
+    message: "CodeBuddy OAuth login completed and account imported.",
+  });
+}
+
 async function startCodeBuddyOAuthSession(options = {}) {
-  if ((codeBuddyOAuthSession.status === "starting" || codeBuddyOAuthSession.status === "waiting") &&
-    isCodeBuddyOAuthSessionActive(codeBuddyOAuthSession)) {
+  applyCodeBuddyOAuthSessionHints(options);
+  if (
+    options.reuseExisting === true &&
+    codeBuddyOAuthSession.status === "waiting" &&
+    isCodeBuddyOAuthSessionActive(codeBuddyOAuthSession) &&
+    codeBuddyOAuthSession.authState
+  ) {
     return getCodeBuddyOAuthSessionPayload({ fresh: true, publicOrigin: options.publicOrigin });
   }
+  clearCodeBuddyOAuthSessionPersistence();
   codeBuddyOAuthSession = createCodeBuddyOAuthSessionState();
   codeBuddyOAuthSession.id = `${Date.now()}-${Math.random().toString(16).slice(2)}`;
   codeBuddyOAuthSession.token = randomUUID();
-  codeBuddyOAuthSession.status = "waiting";
+  codeBuddyOAuthSession.status = "starting";
+  codeBuddyOAuthSession.site = compactText(options.site || "global") || "global";
   codeBuddyOAuthSession.startedAt = Date.now();
   codeBuddyOAuthSession.updatedAt = codeBuddyOAuthSession.startedAt;
   codeBuddyOAuthSession.label = compactText(options.label || "CodeBuddy OAuth");
@@ -1299,126 +2527,85 @@ async function startCodeBuddyOAuthSession(options = {}) {
     token: codeBuddyOAuthSession.token,
   });
   codeBuddyOAuthSession.accessUrl = buildCodeBuddyRemoteUrl({ publicOrigin: options.publicOrigin });
-  codeBuddyOAuthSession.url = codeBuddyOAuthSession.launchUrl;
-  clearMetadataCache(metadataCaches.codeBuddyOAuthSession);
-
+  codeBuddyOAuthSession.callbackUrl = buildCodeBuddyOAuthCallbackUrl({
+    publicOrigin: options.publicOrigin,
+    id: codeBuddyOAuthSession.id,
+    token: codeBuddyOAuthSession.token,
+  });
   try {
-    const login = await triggerCodeBuddyAuthLogin();
-    const externalUrl = normalizeCodeBuddyExternalLoginUrl(login.url || "");
+    const started = await startCodeBuddyPluginAuth({ site: codeBuddyOAuthSession.site });
+    codeBuddyOAuthSession.authState = started.authState;
+    codeBuddyOAuthSession.url = started.authUrl;
+    codeBuddyOAuthSession.status = "waiting";
+    codeBuddyOAuthSession.error = "";
     codeBuddyOAuthSession.login = {
-      ...login,
-      url: externalUrl || codeBuddyOAuthSession.launchUrl,
-      externalUrl,
+      success: true,
+      message: "请在打开的 CodeBuddy 页面完成登录，然后回到管理台点击「检查登录」或等待自动轮询。",
+      url: started.authUrl,
+      externalUrl: started.authUrl,
     };
-    codeBuddyOAuthSession.error = login.message || "";
+    persistCodeBuddyOAuthSession();
   } catch (error) {
+    codeBuddyOAuthSession.status = "failed";
+    codeBuddyOAuthSession.error = error instanceof Error ? error.message : String(error);
     codeBuddyOAuthSession.login = {
       success: false,
-      message: error instanceof Error ? error.message : String(error),
-      url: codeBuddyOAuthSession.launchUrl,
+      message: codeBuddyOAuthSession.error,
+      url: "",
+      externalUrl: "",
     };
-    codeBuddyOAuthSession.error = codeBuddyOAuthSession.login.message;
+    clearCodeBuddyOAuthSessionPersistence();
   }
-
+  clearMetadataCache(metadataCaches.codeBuddyOAuthSession);
   codeBuddyOAuthSession.updatedAt = Date.now();
   clearMetadataCache(metadataCaches.codeBuddyOAuthSession);
   return getCodeBuddyOAuthSessionPayload({ fresh: true, publicOrigin: options.publicOrigin });
 }
 
-async function waitForCodeBuddyOAuthCompletion(callbackUrl = "", options = {}) {
+async function completeCodeBuddyGatewayAuth(callbackUrl = "", options = {}) {
   const rawCallbackUrl = String(callbackUrl || "").trim();
-  const tokenCallback = rawCallbackUrl
-    ? parseCodeBuddyOAuthCallbackUrl(rawCallbackUrl, codeBuddyOAuthSession)
-    : { ok: false, reason: "empty callback url" };
-  const manualCallback = rawCallbackUrl && !tokenCallback.ok
-    ? parseCodeBuddyManualCallbackUrl(rawCallbackUrl)
-    : { ok: false, reason: "empty callback url" };
-  const callbackConfirmed = Boolean(rawCallbackUrl && (tokenCallback.ok || manualCallback.ok));
-
-  if (rawCallbackUrl && !callbackConfirmed) {
-    codeBuddyOAuthSession.status = codeBuddyOAuthSession.status === "complete" ? "complete" : "waiting";
-    codeBuddyOAuthSession.error = `CodeBuddy OAuth 回调无效：${manualCallback.reason || tokenCallback.reason}`;
-    codeBuddyOAuthSession.updatedAt = Date.now();
-    clearMetadataCache(metadataCaches.codeBuddyOAuthSession);
-    const accounts = summarizeCodeBuddyStore(readCodeBuddyStore());
-    return {
-      ok: false,
-      provider: "codebuddy",
-      session: buildCodeBuddyOAuthSessionResponse({
-        publicOrigin: options.publicOrigin,
-        authenticated: codeBuddyOAuthSession.status === "complete",
-      }),
-      accounts,
-      account: accounts.primary,
-    };
-  }
-
-  if (callbackConfirmed) {
+  if (rawCallbackUrl) {
+    const tokenCallback = parseCodeBuddyOAuthCallbackUrl(rawCallbackUrl, codeBuddyOAuthSession);
+    const manualCallback = !tokenCallback.ok ? parseCodeBuddyManualCallbackUrl(rawCallbackUrl) : { ok: false };
+    const gatewayCredential = parseCodeBuddyGatewayCredentialInput(rawCallbackUrl, {
+      cookieHeader: options.cookieHeader,
+      publicOrigin: options.publicOrigin,
+    });
+    if (!(tokenCallback.ok || manualCallback.ok || gatewayCredential.ok || gatewayCredential.authToken)) {
+      codeBuddyOAuthSession.status = "waiting";
+      codeBuddyOAuthSession.error = `CodeBuddy 登录回调无效：${manualCallback.reason || tokenCallback.reason}`;
+      codeBuddyOAuthSession.updatedAt = Date.now();
+      clearMetadataCache(metadataCaches.codeBuddyOAuthSession);
+      const accounts = summarizeCodeBuddyStore(readCodeBuddyStore());
+      return {
+        ok: false,
+        provider: "codebuddy",
+        session: buildCodeBuddyOAuthSessionResponse({ publicOrigin: options.publicOrigin }),
+        accounts,
+        account: accounts.primary,
+      };
+    }
     codeBuddyOAuthSession.callbackUrl = rawCallbackUrl;
     codeBuddyOAuthSession.confirmedAt = Date.now();
     codeBuddyOAuthSession.updatedAt = codeBuddyOAuthSession.confirmedAt;
     clearMetadataCache(metadataCaches.codeBuddyOAuthSession);
-  }
-
-  let authStatus = null;
-  try {
-    authStatus = await fetchCodeBuddyAuthStatus();
-  } catch (error) {
-    codeBuddyOAuthSession.status = "waiting";
-    codeBuddyOAuthSession.error = `CodeBuddy daemon 不可访问：${error instanceof Error ? error.message : String(error)}`;
-    codeBuddyOAuthSession.updatedAt = Date.now();
-    clearMetadataCache(metadataCaches.codeBuddyOAuthSession);
-    const accounts = summarizeCodeBuddyStore(readCodeBuddyStore());
-    return {
-      ok: false,
-      provider: "codebuddy",
-      session: buildCodeBuddyOAuthSessionResponse({
+    if (!tokenCallback.ok && isImportableCodeBuddyBearerToken(gatewayCredential.authToken)) {
+      const imported = importCodeBuddyManualBearerCredential(gatewayCredential.tokenData || gatewayCredential.authToken, {
+        label: options.label || codeBuddyOAuthSession.label,
+        site: options.site || codeBuddyOAuthSession.site || "global",
+        baseUrl: gatewayCredential.baseUrl || "",
+      });
+      return finishCodeBuddyOAuthImport(imported, {
         publicOrigin: options.publicOrigin,
-        authenticated: false,
-      }),
-      accounts,
-      account: accounts.primary,
-    };
+        message: "CodeBuddy OAuth manual credential imported.",
+      });
+    }
   }
+  return pollCodeBuddyOAuthSession(options);
+}
 
-  codeBuddyOAuthSession.authStatus = authStatus;
-  if (!callbackConfirmed && !authStatus.authenticated) {
-    codeBuddyOAuthSession.status = "waiting";
-    codeBuddyOAuthSession.error = "尚未检测到 CodeBuddy 账号登录态；请完成 Web 登录后重试，或粘贴授权后的回调地址。";
-    codeBuddyOAuthSession.updatedAt = Date.now();
-    clearMetadataCache(metadataCaches.codeBuddyOAuthSession);
-    const accounts = summarizeCodeBuddyStore(readCodeBuddyStore());
-    return {
-      ok: false,
-      provider: "codebuddy",
-      session: buildCodeBuddyOAuthSessionResponse({
-        publicOrigin: options.publicOrigin,
-        authenticated: false,
-      }),
-      accounts,
-      account: accounts.primary,
-    };
-  }
-
-  const imported = importCodeBuddyDaemonAccount(authStatus, {
-    label: codeBuddyOAuthSession.label || "CodeBuddy OAuth",
-    confirmed: true,
-  });
-  codeBuddyOAuthSession.status = "complete";
-  codeBuddyOAuthSession.completedAt = Date.now();
-  codeBuddyOAuthSession.error = "";
-  codeBuddyOAuthSession.updatedAt = Date.now();
-  clearMetadataCache(metadataCaches.codeBuddyOAuthSession);
-  return {
-    ok: true,
-    provider: "codebuddy",
-    session: buildCodeBuddyOAuthSessionResponse({
-      publicOrigin: options.publicOrigin,
-      authenticated: true,
-    }),
-    accounts: imported.accounts,
-    account: imported.account,
-  };
+async function waitForCodeBuddyOAuthCompletion(callbackUrl = "", options = {}) {
+  return completeCodeBuddyGatewayAuth(callbackUrl, options);
 }
 
 function resolveCursorAgentBinary() {
@@ -1431,10 +2618,17 @@ function resolveCursorAgentBinary() {
   }
 
   const candidates = [
+    path.join(homedir(), ".local", "bin", "cursor-agent"),
     path.join(homedir(), ".cursor-agent", "cursor-agent"),
     "/usr/local/bin/cursor-agent",
     "/usr/bin/cursor-agent",
   ];
+  const versionsDir = path.join(homedir(), ".local", "share", "cursor-agent", "versions");
+  if (existsSync(versionsDir)) {
+    for (const version of readdirSync(versionsDir).sort().reverse()) {
+      candidates.push(path.join(versionsDir, version, "cursor-agent"));
+    }
+  }
   for (const candidate of candidates) {
     if (existsSync(candidate)) return candidate;
   }
@@ -1446,9 +2640,25 @@ function stripAnsi(value) {
 }
 
 function extractCursorLoginUrl(output) {
-  const compact = stripAnsi(output).replace(/\s+/g, "");
-  const match = compact.match(/https:\/\/cursor\.com\/loginDeepControl(?:\?[A-Za-z0-9._~%=&-]*)?/);
-  return match ? match[0] : "";
+  const text = stripAnsi(String(output ?? ""));
+  const patterns = [
+    /https:\/\/cursor\.com\/loginDeepControl\?[^\s\]"')\]]+/i,
+    /https:\/\/www\.cursor\.com\/loginDeepControl\?[^\s\]"')\]]+/i,
+  ];
+  for (const pattern of patterns) {
+    const match = text.match(pattern);
+    if (match) return match[0].replace(/[.,;]+$/, "");
+  }
+  const compact = text.replace(/\s+/g, "");
+  const legacy = compact.match(/https:\/\/cursor\.com\/loginDeepControl(?:\?[A-Za-z0-9._~%=&+\/-]*)?/);
+  return legacy ? legacy[0] : "";
+}
+
+function isDirectOAuthSessionFresh(session = oauthSession, now = Date.now()) {
+  if (!session?.url || session.status !== "waiting") return false;
+  if (!session.child || session.child.exitCode !== null) return false;
+  if (!session.startedAt) return false;
+  return now - Number(session.startedAt) < OAUTH_SESSION_TTL_MS;
 }
 
 function getOAuthSessionSnapshot() {
@@ -1513,13 +2723,17 @@ function importCurrentAuthFileToPool(options = {}) {
   };
 }
 
-async function startDirectOAuthSession() {
-  if (oauthSession.child && oauthSession.child.exitCode === null) {
+async function startDirectOAuthSession(options = {}) {
+  const force = options.force === true;
+  if (!force && isDirectOAuthSessionFresh()) {
     return {
       reused: true,
       session: getOAuthSessionSnapshot(),
       accounts: summarizeAccountsStore(readAccountsStore()),
     };
+  }
+  if (oauthSession.child && oauthSession.child.exitCode === null) {
+    stopDirectOAuthSession("replaced");
   }
 
   oauthSession = createOAuthSessionState();
@@ -2849,19 +4063,145 @@ function extractTextContent(content) {
   return JSON.stringify(content);
 }
 
-function buildPromptFromMessages(messages) {
-  const lines = [];
-  for (const message of Array.isArray(messages) ? messages : []) {
-    const role = typeof message?.role === "string" ? message.role : "user";
-    const content = extractTextContent(message?.content).trim();
-    if (!content) continue;
-    if (role === "tool") {
-      lines.push(`TOOL_RESULT (${message?.tool_call_id || "unknown"}): ${content}`);
-    } else {
-      lines.push(`${role.toUpperCase()}: ${content}`);
+function normalizeOpenAiTools(tools) {
+  if (!Array.isArray(tools)) return [];
+  return tools
+    .map((tool) => {
+      if (tool?.type === "function" && tool.function && typeof tool.function.name === "string") {
+        const name = tool.function.name.trim();
+        if (!name) return null;
+        return {
+          name,
+          description: typeof tool.function.description === "string" ? tool.function.description : "",
+          input_schema: tool.function.parameters && typeof tool.function.parameters === "object"
+            ? tool.function.parameters
+            : { type: "object", properties: {} },
+        };
+      }
+      return normalizeClaudeTools([tool])[0] || null;
+    })
+    .filter(Boolean);
+}
+
+function normalizeOpenAiToolChoice(toolChoice) {
+  if (toolChoice == null || toolChoice === "auto") return { type: "auto" };
+  if (toolChoice === "none") return { type: "none" };
+  if (toolChoice === "required") return { type: "any" };
+  if (typeof toolChoice === "object") {
+    if (toolChoice.type === "function" && typeof toolChoice.function?.name === "string" && toolChoice.function.name.trim()) {
+      return { type: "tool", name: toolChoice.function.name.trim() };
     }
+    return normalizeClaudeToolChoice(toolChoice);
+  }
+  return { type: "auto" };
+}
+
+function getDirectToolOptions(body = {}) {
+  const tools = normalizeOpenAiTools(body.tools);
+  const toolChoice = normalizeOpenAiToolChoice(body.tool_choice);
+  return { tools, toolChoice };
+}
+
+function shouldAttemptDirectToolUse(options = {}) {
+  const tools = normalizeClaudeTools(options.tools);
+  const toolChoice = normalizeClaudeToolChoice(options.toolChoice);
+  return tools.length > 0 && toolChoice?.type !== "none";
+}
+
+function buildOpenAiToolsPrompt(tools = [], toolChoice = null) {
+  return buildOpenAiToolsPromptLite(normalizeOpenAiTools(tools), normalizeOpenAiToolChoice(toolChoice));
+}
+
+function formatOpenAiMessageForPrompt(message) {
+  const role = typeof message?.role === "string" ? message.role : "user";
+  if (role === "system") {
+    const text = extractTextContent(message?.content).trim();
+    return text ? [`SYSTEM: ${text}`] : [];
+  }
+  if (role === "assistant") {
+    const lines = [];
+    const text = extractTextContent(message?.content).trim();
+    if (text) lines.push(`ASSISTANT: ${text}`);
+    for (const call of Array.isArray(message?.tool_calls) ? message.tool_calls : []) {
+      const fn = call?.function && typeof call.function === "object" ? call.function : {};
+      const args = typeof fn.arguments === "string"
+        ? fn.arguments
+        : JSON.stringify(fn.arguments || {});
+      lines.push(`ASSISTANT_TOOL_CALL (${call?.id || "unknown"}): ${fn.name || "unknown"} ${args}`);
+    }
+    return lines;
+  }
+  if (role === "tool") {
+    const text = extractTextContent(message?.content).trim();
+    const id = message?.tool_call_id || message?.name || "unknown";
+    return [`TOOL_RESULT (${id}): ${text || ""}`];
+  }
+  const content = extractTextContent(message?.content).trim();
+  return content ? [`${role.toUpperCase()}: ${content}`] : [];
+}
+
+function buildPromptFromOpenAiMessages(messages, options = {}) {
+  const lines = [];
+  const toolsPrompt = buildOpenAiToolsPrompt(options.tools, options.toolChoice);
+  const msgList = Array.isArray(messages) ? messages : [];
+  // tool shim goes first (original behavior — keeps cursor_native path intact)
+  if (toolsPrompt) lines.push(toolsPrompt);
+  for (const message of msgList) {
+    lines.push(...formatOpenAiMessageForPrompt(message));
+  }
+  // F2-safe: append continuation nudge only when last message is a tool result
+  const lastMsg = msgList[msgList.length - 1];
+  if (lastMsg?.role === "tool" && toolsPrompt) {
+    lines.push("NEXT_STEP: Tool result received. If the task has more steps, call the next tool now. If done, give your final answer.");
   }
   return lines.join("\n\n").trim() || "Hello";
+}
+
+function buildPromptFromMessages(messages, options = {}) {
+  if (options.tools || options.toolChoice) {
+    return buildPromptFromOpenAiMessages(messages, options);
+  }
+  const lines = [];
+  for (const message of Array.isArray(messages) ? messages : []) {
+    lines.push(...formatOpenAiMessageForPrompt(message));
+  }
+  return lines.join("\n\n").trim() || "Hello";
+}
+
+function toOpenAiToolCallId(id) {
+  const raw = String(id || "").trim();
+  if (!raw) return `call_${randomUUID().replace(/-/g, "")}`;
+  if (raw.startsWith("call_")) return raw;
+  return `call_${raw.replace(/^toolu_/, "")}`;
+}
+
+function resolveDirectToolUse(result, options = {}) {
+  const bridgeOptions = {
+    ...options,
+    tools: normalizeOpenAiTools(options.tools) || normalizeClaudeTools(options.tools),
+    toolChoice: options.toolChoice || normalizeOpenAiToolChoice(options.rawToolChoice),
+    prompt: options.prompt || "",
+  };
+  if (result?.toolUse) {
+    return normalizeToolUseForClient(result.toolUse, bridgeOptions);
+  }
+  const parsed = parseClaudeToolUse(result?.text || "", options);
+  if (parsed) return normalizeToolUseForClient(parsed, bridgeOptions);
+  const synthesized = synthesizeForcedToolUse(bridgeOptions)
+    || synthesizeAnyToolUse(bridgeOptions);
+  if (synthesized) return normalizeToolUseForClient(synthesized, bridgeOptions);
+  return null;
+}
+
+function createDirectProviderTurn(result, toolUse, prompt) {
+  const text = toolUse ? "" : String(result?.text || "");
+  return {
+    text,
+    toolUses: toolUse
+      ? [{ id: toolUse.id, name: toolUse.name, input: toolUse.input && typeof toolUse.input === "object" ? toolUse.input : {} }]
+      : [],
+    usage: estimateUsage(prompt, text || JSON.stringify(toolUse?.input || {})),
+  };
 }
 
 function extractClaudeTextContent(content) {
@@ -2965,15 +4305,20 @@ function formatClaudeMessageForPrompt(message) {
 function buildPromptFromClaudeMessages(messages, system = undefined, options = {}) {
   const lines = [];
   const systemText = extractClaudeTextContent(system).trim();
-  if (systemText) lines.push(`SYSTEM: ${systemText}`);
-
+  if (systemText) lines.push("SYSTEM: " + systemText);
   const toolsPrompt = buildClaudeToolsPrompt(options.tools, options.toolChoice);
   if (toolsPrompt) lines.push(toolsPrompt);
-
-  for (const message of Array.isArray(messages) ? messages : []) {
+  const msgList = Array.isArray(messages) ? messages : [];
+  for (const message of msgList) {
     lines.push(...formatClaudeMessageForPrompt(message));
   }
-
+  // F2-safe: continuation signal when last message is a tool_result
+  const lastMsg = msgList[msgList.length - 1];
+  const lastIsToolResult = lastMsg?.role === "user" && Array.isArray(lastMsg?.content) &&
+    lastMsg.content.some((p) => p?.type === "tool_result");
+  if (lastIsToolResult && toolsPrompt) {
+    lines.push("NEXT_STEP: Tool result received. If the task has more steps, call the next tool now. If done, give your final answer.");
+  }
   return lines.join("\n\n").trim() || "Hello";
 }
 
@@ -3101,11 +4446,19 @@ function buildCursorNativeToolUse(event, options = {}) {
 }
 
 function findCursorNativeToolUse(events = [], options = {}) {
-  for (const event of Array.isArray(events) ? events : []) {
-    const toolUse = buildCursorNativeToolUse(event, options);
-    if (toolUse) return toolUse;
-  }
-  return null;
+  const bridgeOptions = {
+    ...options,
+    tools: normalizeOpenAiTools(options.tools) || normalizeClaudeTools(options.tools),
+    prompt: options.prompt || "",
+  };
+  return findNativeToolUseInEvents(events, bridgeOptions)
+    || (() => {
+      for (const event of Array.isArray(events) ? events : []) {
+        const toolUse = buildCursorNativeToolUse(event, options);
+        if (toolUse) return toolUse;
+      }
+      return null;
+    })();
 }
 
 function parseClaudeToolUse(text, options = {}) {
@@ -3206,13 +4559,23 @@ function runDirectCompletion(prompt, model, options = {}) {
       }
     };
 
+    const bridgeTools = shouldBridgeClientTools({
+      tools: normalizeOpenAiTools(options.tools) || normalizeClaudeTools(options.tools),
+      toolChoice: options.toolChoice,
+    }) || Boolean(options.captureNativeToolUse);
+    const bridgeOptions = {
+      ...options,
+      tools: normalizeOpenAiTools(options.tools) || normalizeClaudeTools(options.tools),
+      prompt,
+    };
+
     const finishWithCurrentData = (reason = "complete") => {
       const text = accumulator.text;
       if (status && status !== 200) {
         settle(reject, makeError(`Cursor direct HTTP ${status}`));
         return;
       }
-      if (!text) {
+      if (!text && !bridgeTools) {
         const suffix = reason === "hard-timeout" ? " before timeout" : "";
         settle(reject, makeError(`Cursor direct returned no assistant text${suffix} (${responseBytes} bytes)`));
         return;
@@ -3268,20 +4631,24 @@ function runDirectCompletion(prompt, model, options = {}) {
         settle(reject, makeError(error instanceof Error ? error.message : String(error)));
         return;
       }
-      const nativeToolUse = options.captureNativeToolUse ? findCursorNativeToolUse(events, options) : null;
-      if (nativeToolUse) {
-        settle(resolve, {
-          text: accumulator.text,
-          toolUse: nativeToolUse,
-          status,
-          durationMs: Date.now() - started,
-          bytes: responseBytes,
-          stringCount,
-          deltaCount,
-        });
-        return;
+      if (bridgeTools) {
+        const nativeToolUse = findNativeToolUseInEvents(events, bridgeOptions)
+          || findCursorNativeToolUse(events, bridgeOptions);
+        if (nativeToolUse) {
+          settle(resolve, {
+            text: accumulator.text,
+            toolUse: normalizeToolUseForClient(nativeToolUse, bridgeOptions),
+            status,
+            durationMs: Date.now() - started,
+            bytes: responseBytes,
+            stringCount,
+            deltaCount,
+          });
+          return;
+        }
+      } else {
+        writeCursorClientResponses(events, request, cursorClientState);
       }
-      writeCursorClientResponses(events, request, cursorClientState);
       handleCompletionEvents(events);
       if (settled) return;
       clearTimeout(idleTimer);
@@ -3323,6 +4690,7 @@ async function runDirectCompletionWithRetry(prompt, model, options = {}) {
         signal: options.signal,
         tools: options.tools,
         toolChoice: options.toolChoice,
+        prompt,
         captureNativeToolUse: options.captureNativeToolUse,
         onDelta: (delta, meta) => {
           emittedOnAttempt = emittedOnAttempt || Boolean(delta);
@@ -3330,6 +4698,12 @@ async function runDirectCompletionWithRetry(prompt, model, options = {}) {
         },
       });
       markResult(selection, true, { outputChars: result.text.length });
+      // F3: retry if empty text and no tool use (silent failure)
+      const emptyResult = !result.text && !result.toolUse;
+      if (emptyResult && !options.accountId && attempt + 1 < maxAttempts) {
+        log("debug", "cursor direct empty response, retrying", { attempt: attempt + 1 });
+        continue;
+      }
       return {
         ...result,
         account: summarizeDirectAccount(selection.account),
@@ -3350,6 +4724,37 @@ async function runDirectCompletionWithRetry(prompt, model, options = {}) {
   }
 
   throw lastError || new Error("Cursor direct request failed");
+}
+
+
+async function runDirectPoolWithToolFallback(prompt, model, directToolOptions, poolOptions = {}) {
+  const poolBase = {
+    ...poolOptions,
+    tools: directToolOptions.tools,
+    prompt,
+    captureNativeToolUse: true,
+  };
+  let result = await runDirectCompletionFromPool(prompt, model, {
+    ...poolBase,
+    toolChoice: directToolOptions.toolChoice,
+  });
+  let toolUse = resolveDirectToolUse(result, { ...directToolOptions, prompt });
+  const pinnedName = directToolOptions.toolChoice?.type === "tool" ? directToolOptions.toolChoice.name : "";
+  if (!toolUse && pinnedName) {
+    const relaxedResult = await runDirectCompletionFromPool(prompt, model, {
+      ...poolBase,
+      toolChoice: { type: "any" },
+    });
+    const relaxedUse = resolveDirectToolUse(relaxedResult, {
+      ...directToolOptions,
+      toolChoice: { type: "any" },
+      prompt,
+    });
+    if (relaxedUse?.name === pinnedName) {
+      return { result: relaxedResult, toolUse: relaxedUse };
+    }
+  }
+  return { result, toolUse };
 }
 
 async function runDirectCompletionFromPool(prompt, model, options = {}) {
@@ -3470,8 +4875,14 @@ function shouldAttemptClaudeToolUse(options = {}) {
 }
 
 function createClaudeMessagesResponse(model, content, prompt, options = {}) {
+  const bridgeOptions = {
+    ...options,
+    tools: normalizeClaudeTools(options.tools),
+    prompt,
+  };
   const toolUse = options.nativeToolUse
-    || (shouldAttemptClaudeToolUse(options) ? parseClaudeToolUse(content, options) : null);
+    || (shouldAttemptClaudeToolUse(options) ? parseClaudeToolUse(content, options) : null)
+    || synthesizeForcedToolUse(bridgeOptions);
   if (toolUse) {
     return createClaudeToolUseMessage(model, toolUse, prompt, {
       id: options.id,
@@ -3721,7 +5132,7 @@ function createCodeBuddyProxyResponseHeaders(upstreamResponse, targetUrl, public
 
 async function handleCodeBuddyRemoteProxy(req, res, url) {
   if (!isCodeBuddyOAuthLaunchAuthorized(req)) {
-    const response = openAiError(401, "authentication_error", "CodeBuddy OAuth session required");
+    const response = openAiError(401, "authentication_error", "CodeBuddy gateway login session required");
     res.writeHead(response.status, response.headers);
     res.end(response.body);
     return;
@@ -3834,11 +5245,18 @@ function handleCodeBuddyRemoteUpgrade(req, socket, head) {
 async function handleCodeBuddyOAuthCallback(req, res, url) {
   const publicOrigin = getPublicOrigin(req);
   try {
-    const result = await waitForCodeBuddyOAuthCompletion(url.toString(), { publicOrigin });
+    const result = await waitForCodeBuddyOAuthCompletion(url.toString(), {
+      publicOrigin,
+      cookieHeader: req.headers.cookie || "",
+    });
     const message = result.ok
-      ? "CodeBuddy OAuth 已确认，账号已导入账号池。"
-      : result.session?.error || codeBuddyOAuthSession.error || "CodeBuddy OAuth 尚未完成。";
-    const response = buildCodeBuddyOAuthLaunchPage(message, { publicOrigin });
+      ? "CodeBuddy 登录已确认，账号已导入账号池。"
+      : result.session?.error || codeBuddyOAuthSession.error || "CodeBuddy 登录尚未完成。";
+    const response = buildCodeBuddyOAuthLaunchPage(message, {
+      publicOrigin,
+      notifyAdmin: true,
+      success: Boolean(result.ok),
+    });
     res.writeHead(result.ok ? 200 : 409, {
       ...response.headers,
       "cache-control": "no-store",
@@ -3847,7 +5265,7 @@ async function handleCodeBuddyOAuthCallback(req, res, url) {
     res.end(response.body);
   } catch (error) {
     const response = buildCodeBuddyOAuthLaunchPage(
-      `CodeBuddy OAuth 回调失败：${error instanceof Error ? error.message : String(error)}`,
+      `CodeBuddy 登录回调失败：${error instanceof Error ? error.message : String(error)}`,
       { publicOrigin },
     );
     res.writeHead(500, {
@@ -3897,7 +5315,7 @@ async function handleCodeBuddyOAuthLaunch(req, res, url) {
   const setCookie = `cursor_codebuddy_oauth=${encodeURIComponent(token)}; Path=/; Max-Age=900; HttpOnly; SameSite=Lax`;
   const deny = () => {
     const response = html(403, buildCodeBuddyOAuthLaunchPage(
-      "授权入口已失效或参数不正确，请回到管理台重新生成 CodeBuddy OAuth 登录入口。",
+      "登录入口已失效或参数不正确，请回到管理台重新生成 CodeBuddy 登录入口。",
       { publicOrigin },
     ).body);
     res.writeHead(response.status, response.headers);
@@ -3910,45 +5328,40 @@ async function handleCodeBuddyOAuthLaunch(req, res, url) {
   }
 
   try {
-    codeBuddyOAuthSession.status = "waiting";
     codeBuddyOAuthSession.launchUrl ||= buildCodeBuddyOAuthLaunchUrl({ publicOrigin, id, token });
     codeBuddyOAuthSession.accessUrl = buildCodeBuddyRemoteUrl({ publicOrigin });
     codeBuddyOAuthSession.callbackUrl ||= buildCodeBuddyOAuthCallbackUrl({ publicOrigin, id, token });
-    codeBuddyOAuthSession.status = "waiting";
     codeBuddyOAuthSession.updatedAt = Date.now();
-
-    let login = codeBuddyOAuthSession.login;
-    let loginUrl = normalizeCodeBuddyExternalLoginUrl(login?.externalUrl || login?.url || "");
-    if (!loginUrl) {
-      login = await triggerCodeBuddyAuthLogin().catch((error) => ({
-        success: false,
-        message: error instanceof Error ? error.message : String(error),
-        url: "",
-      }));
-      loginUrl = normalizeCodeBuddyExternalLoginUrl(login.url || "");
-      codeBuddyOAuthSession.login = {
-        ...login,
-        url: loginUrl || codeBuddyOAuthSession.launchUrl,
-        externalUrl: loginUrl,
-      };
-      codeBuddyOAuthSession.error = login.success ? "" : (login.message || "");
-    }
-
     clearMetadataCache(metadataCaches.codeBuddyOAuthSession);
 
-    res.writeHead(302, {
-      location: loginUrl || buildCodeBuddyRemoteUrl({ publicOrigin: "" }),
+    const authUrl = compactText(codeBuddyOAuthSession.url || codeBuddyOAuthSession.login?.url || "");
+    if (authUrl && codeBuddyOAuthSession.status === "waiting") {
+      res.writeHead(302, {
+        location: authUrl,
+        "set-cookie": setCookie,
+        "cache-control": "no-store",
+      });
+      res.end();
+      return;
+    }
+
+    const response = buildCodeBuddyOAuthLaunchPage(
+      codeBuddyOAuthSession.error || "请回到管理台重新发起 CodeBuddy OAuth 登录。",
+      { publicOrigin },
+    );
+    res.writeHead(codeBuddyOAuthSession.status === "failed" ? 500 : 409, {
+      ...response.headers,
       "set-cookie": setCookie,
       "cache-control": "no-store",
     });
-    res.end();
+    res.end(response.body);
   } catch (error) {
     codeBuddyOAuthSession.status = "failed";
     codeBuddyOAuthSession.error = error instanceof Error ? error.message : String(error);
     codeBuddyOAuthSession.updatedAt = Date.now();
     clearMetadataCache(metadataCaches.codeBuddyOAuthSession);
     const response = buildCodeBuddyOAuthLaunchPage(
-      `CodeBuddy OAuth 启动失败：${codeBuddyOAuthSession.error}`,
+      `CodeBuddy 登录入口启动失败：${codeBuddyOAuthSession.error}`,
       { publicOrigin },
     );
     res.writeHead(500, {
@@ -3971,6 +5384,7 @@ function getMemorySnapshot() {
 }
 
 function getStatusPayload() {
+  const codeBuddyChatEndpoint = resolveConfiguredCodeBuddyChatEndpoint();
   return {
     ok: true,
     mode: "cursor-direct",
@@ -3981,6 +5395,11 @@ function getStatusPayload() {
     codeBuddy: {
       accountsPath: config.codeBuddyAccountsPath,
       baseUrl: normalizeCodeBuddyBaseUrl(config.codeBuddyBaseUrl),
+      apiEndpoint: String(config.codeBuddyApiEndpoint || ""),
+      chatEndpoint: codeBuddyChatEndpoint,
+      chatCompletionsPath: String(config.codeBuddyChatCompletionsPath || DEFAULT_CODEBUDDY_CHAT_COMPLETIONS_PATH),
+      internetEnvironment: String(config.codeBuddyInternetEnvironment || ""),
+      transport: config.codeBuddyTransport,
       models: listConfiguredCodeBuddyModels().map((model) => model.id),
     },
     agentHost: config.agentHost,
@@ -4011,6 +5430,11 @@ function buildDirectAdminStatusPayload(options = {}) {
     codeBuddy: {
       accountsPath: config.codeBuddyAccountsPath,
       baseUrl: normalizeCodeBuddyBaseUrl(config.codeBuddyBaseUrl),
+      apiEndpoint: String(config.codeBuddyApiEndpoint || ""),
+      chatEndpoint: status.codeBuddy.chatEndpoint,
+      chatCompletionsPath: String(config.codeBuddyChatCompletionsPath || DEFAULT_CODEBUDDY_CHAT_COMPLETIONS_PATH),
+      internetEnvironment: String(config.codeBuddyInternetEnvironment || ""),
+      transport: config.codeBuddyTransport,
       models: listConfiguredCodeBuddyModels().map((model) => model.id),
     },
     memory: getMemorySnapshot(),
@@ -4021,6 +5445,10 @@ function buildDirectAdminStatusPayload(options = {}) {
       accountsPath: config.accountsPath,
       codeBuddyAccountsPath: config.codeBuddyAccountsPath,
       codeBuddyBaseUrl: normalizeCodeBuddyBaseUrl(config.codeBuddyBaseUrl),
+      codeBuddyApiEndpoint: config.codeBuddyApiEndpoint,
+      codeBuddyChatCompletionsPath: config.codeBuddyChatCompletionsPath,
+      codeBuddyInternetEnvironment: config.codeBuddyInternetEnvironment,
+      codeBuddyTransport: config.codeBuddyTransport,
       codeBuddyModels: config.codeBuddyModels,
       agentHost: config.agentHost,
       clientVersion: config.clientVersion,
@@ -4142,14 +5570,21 @@ async function handle(req, res) {
 
     if (routePath === "/direct-admin/api/codebuddy/status" && req.method === "GET") {
       try {
-        const authStatus = await fetchCodeBuddyAuthStatus().catch(() => null);
+        const accounts = summarizeCodeBuddyStore(readCodeBuddyStore());
+        const chatEndpoint = resolveConfiguredCodeBuddyChatEndpoint();
         const response = json(200, {
           ok: true,
           provider: "codebuddy",
+          configured: Boolean(accounts.primary?.hasCredentials),
           baseUrl: normalizeCodeBuddyBaseUrl(config.codeBuddyBaseUrl),
-          accounts: summarizeCodeBuddyStore(readCodeBuddyStore()),
-          models: listConfiguredCodeBuddyModels(),
-          authStatus,
+          apiEndpoint: String(config.codeBuddyApiEndpoint || ""),
+          chatEndpoint,
+          chatCompletionsPath: String(config.codeBuddyChatCompletionsPath || DEFAULT_CODEBUDDY_CHAT_COMPLETIONS_PATH),
+          internetEnvironment: String(config.codeBuddyInternetEnvironment || ""),
+          transport: config.codeBuddyTransport,
+          accounts,
+          models: [],
+          modelsSource: accounts.primary?.hasCredentials ? "account" : "no_credentials",
         });
         res.writeHead(response.status, response.headers);
         res.end(response.body);
@@ -4166,6 +5601,7 @@ async function handle(req, res) {
         const response = json(200, await getCodeBuddyOAuthSessionPayload({
           fresh: url.searchParams.get("fresh") === "1",
           publicOrigin: getPublicOrigin(req),
+          cookieHeader: req.headers.cookie || "",
         }));
         res.writeHead(response.status, response.headers);
         res.end(response.body);
@@ -4182,6 +5618,8 @@ async function handle(req, res) {
         const body = await readRequestBody(req).catch(() => ({}));
         const response = json(200, await startCodeBuddyOAuthSession({
           label: body?.label || "",
+          site: body?.site || "global",
+          reuseExisting: body?.reuseExisting === true,
           publicOrigin: getPublicOrigin(req),
         }));
         res.writeHead(response.status, response.headers);
@@ -4197,7 +5635,34 @@ async function handle(req, res) {
     if (routePath === "/direct-admin/api/codebuddy/oauth/callback" && req.method === "POST") {
       try {
         const body = await readRequestBody(req).catch(() => ({}));
-        const response = json(200, await waitForCodeBuddyOAuthCompletion(body?.callbackUrl || body?.url || "", {
+        const response = json(200, await waitForCodeBuddyOAuthCompletion(
+          body?.callbackUrl || body?.url || body?.input || body?.value || "",
+          {
+          publicOrigin: getPublicOrigin(req),
+          cookieHeader: req.headers.cookie || "",
+          label: body?.label || "",
+          site: body?.site || "",
+        }));
+        res.writeHead(response.status, response.headers);
+        res.end(response.body);
+      } catch (error) {
+        const response = openAiError(500, "internal_error", error instanceof Error ? error.message : String(error));
+        res.writeHead(response.status, response.headers);
+        res.end(response.body);
+      }
+      return;
+    }
+
+    if (routePath === "/direct-admin/api/codebuddy/oauth/poll" && req.method === "POST") {
+      try {
+        const body = await readRequestBody(req).catch(() => ({}));
+        const burst = body?.burst === true || Number(body?.maxAttempts || 0) > 1;
+        const response = json(200, await pollCodeBuddyOAuthSession({
+          authState: body?.authState || "",
+          site: body?.site || "",
+          label: body?.label || "",
+          maxAttempts: burst ? Number(body?.maxAttempts || 15) : 1,
+          intervalMs: Number(body?.intervalMs || 2000),
           publicOrigin: getPublicOrigin(req),
         }));
         res.writeHead(response.status, response.headers);
@@ -4223,24 +5688,56 @@ async function handle(req, res) {
       return;
     }
 
-    if (routePath === "/direct-admin/api/codebuddy/accounts/import" && req.method === "POST") {
+    if (routePath === "/direct-admin/api/codebuddy/daemon/status" && req.method === "GET") {
       try {
-        const body = await readRequestBody(req);
-        const result = importCodeBuddyAccounts(readCodeBuddyStore(), body);
-        if (result.imported.length === 0) throw new Error("No CodeBuddy accounts found in request body");
-        const store = writeCodeBuddyStore(result.store);
+        const health = await checkCodeBuddyDaemonHealth({ serveUrl: config.codeBuddyServeUrl });
+        const response = json(200, summarizeCodeBuddyDaemonStatus(health, getCodeBuddyDaemonConfig()));
+        res.writeHead(response.status, response.headers);
+        res.end(response.body);
+      } catch (error) {
+        const response = openAiError(500, "internal_error", error instanceof Error ? error.message : String(error));
+        res.writeHead(response.status, response.headers);
+        res.end(response.body);
+      }
+      return;
+    }
+
+    if (routePath === "/direct-admin/api/codebuddy/daemon/ensure" && req.method === "POST") {
+      try {
+        const ensured = await ensureCodeBuddyDaemonRunning({
+          serveUrl: config.codeBuddyServeUrl,
+          site: config.codeBuddySite,
+          internetEnvironment: config.codeBuddyInternetEnvironment,
+          baseUrl: config.codeBuddyBaseUrl,
+          autoStart: true,
+        });
         const response = json(200, {
           ok: true,
-          imported: result.summaries,
-          accounts: summarizeCodeBuddyStore(store),
+          ...summarizeCodeBuddyDaemonStatus(ensured.health, ensured.config),
+          started: ensured.started,
+          pid: ensured.pid || null,
         });
         res.writeHead(response.status, response.headers);
         res.end(response.body);
       } catch (error) {
-        const response = openAiError(400, "invalid_request_error", error instanceof Error ? error.message : String(error));
+        const response = openAiError(502, "upstream_error", error instanceof Error ? error.message : String(error));
         res.writeHead(response.status, response.headers);
         res.end(response.body);
       }
+      return;
+    }
+
+    if (routePath === "/direct-admin/api/codebuddy/credentials/local" && req.method === "POST") {
+      const response = openAiError(410, "invalid_request_error", "CodeBuddy manual local credential import is disabled. Use CodeBuddy OAuth login from /direct-admin/#codebuddy.");
+      res.writeHead(response.status, response.headers);
+      res.end(response.body);
+      return;
+    }
+
+    if (routePath === "/direct-admin/api/codebuddy/accounts/import" && req.method === "POST") {
+      const response = openAiError(410, "invalid_request_error", "CodeBuddy manual account import is disabled. Use CodeBuddy OAuth login from /direct-admin/#codebuddy.");
+      res.writeHead(response.status, response.headers);
+      res.end(response.body);
       return;
     }
 
@@ -4251,12 +5748,20 @@ async function handle(req, res) {
       try {
         if (req.method === "DELETE" && !action) {
           const store = readCodeBuddyStore();
+          const removedAccount = store.accounts.find((account) => account.id === accountId) || null;
           const nextStore = writeCodeBuddyStore({
             ...store,
             accounts: store.accounts.filter((account) => account.id !== accountId),
             nextIndex: 0,
+          }, { allowShrink: true });
+          const credCleanup = removedAccount
+            ? removeCodeBuddyLocalCredentialIfMatches(removedAccount)
+            : { ok: true, removed: false };
+          const response = json(200, {
+            ok: true,
+            accounts: summarizeCodeBuddyStore(nextStore),
+            credCleanup,
           });
-          const response = json(200, { ok: true, accounts: summarizeCodeBuddyStore(nextStore) });
           res.writeHead(response.status, response.headers);
           res.end(response.body);
           return;
@@ -4279,6 +5784,37 @@ async function handle(req, res) {
           return;
         }
 
+        if (req.method === "POST" && action === "refresh-token") {
+          const selection = selectCodeBuddyAccountFromPool({ accountId });
+          const refreshed = await refreshCodeBuddySelectedAccount(selection, { force: true });
+          const response = json(200, {
+            ok: true,
+            refreshed: Boolean(refreshed.refreshedCodeBuddyToken),
+            account: summarizeCodeBuddyAccount(refreshed.account),
+            accounts: summarizeCodeBuddyStore(readCodeBuddyStore()),
+          });
+          res.writeHead(response.status, response.headers);
+          res.end(response.body);
+          return;
+        }
+
+        if (req.method === "GET" && action === "usage") {
+          const store = readCodeBuddyStore();
+          const account = store.accounts.find((item) => item.id === accountId);
+          if (!account) throw new Error(`CodeBuddy account not found: ${accountId}`);
+          if (!hasCodeBuddyCredentials(account)) {
+            throw new Error(`CodeBuddy account has no credentials: ${accountId}`);
+          }
+          const usage = await fetchCodeBuddyAccountUsage(account);
+          const response = json(200, {
+            ...usage,
+            account: summarizeCodeBuddyAccount(account),
+          });
+          res.writeHead(response.status, response.headers);
+          res.end(response.body);
+          return;
+        }
+
         const response = openAiError(404, "not_found_error", `Unsupported CodeBuddy account action: ${action || req.method}`);
         res.writeHead(response.status, response.headers);
         res.end(response.body);
@@ -4291,13 +5827,19 @@ async function handle(req, res) {
     }
 
     if (routePath === "/direct-admin/api/codebuddy/models" && req.method === "GET") {
-      const response = json(200, {
-        ok: true,
-        provider: "codebuddy",
-        models: listConfiguredCodeBuddyModels(),
-      });
-      res.writeHead(response.status, response.headers);
-      res.end(response.body);
+      try {
+        const response = json(200, await listCodeBuddyModelsForAdmin({
+          fresh: url.searchParams.get("fresh") === "1",
+          discover: url.searchParams.get("discover") === "1",
+          accountId: url.searchParams.get("accountId") || "",
+        }));
+        res.writeHead(response.status, response.headers);
+        res.end(response.body);
+      } catch (error) {
+        const response = openAiError(502, "upstream_error", error instanceof Error ? error.message : String(error));
+        res.writeHead(response.status, response.headers);
+        res.end(response.body);
+      }
       return;
     }
 
@@ -4312,13 +5854,19 @@ async function handle(req, res) {
         return;
       }
 
-      const providerModel = resolveGatewayProviderModel(body?.model || "codebuddy/default");
+      const providerModel = resolveGatewayProviderModel(body?.model || "codebuddy/auto");
       const prompt = String(body?.prompt || "Reply with EXACTLY CODEBUDDY_DIRECT_OK and no other text.");
+      const probeMessages = [
+        { role: "system", content: "You are a helpful assistant." },
+        { role: "user", content: prompt },
+      ];
       const started = Date.now();
       try {
-        const result = await runCodeBuddyCompletionFromPool([{ role: "user", content: prompt }], {
+        const result = await runCodeBuddyCompletionFromPool(probeMessages, {
           accountId: body?.accountId || "",
           model: providerModel.model,
+          stream: true,
+          daemonRunTimeoutMs: Number(body?.timeoutMs || config.codeBuddyRunTimeoutMs || 120000),
         });
         const response = json(200, {
           ok: true,
@@ -4336,7 +5884,9 @@ async function handle(req, res) {
         res.writeHead(response.status, response.headers);
         res.end(response.body);
       } catch (error) {
-        const response = openAiError(502, "upstream_error", error instanceof Error ? error.message : String(error));
+        const message = error instanceof Error ? error.message : String(error);
+        log("warn", "codebuddy admin probe failed", { message: message.slice(0, 400) });
+        const response = openAiError(502, "upstream_error", message);
         res.writeHead(response.status, response.headers);
         res.end(response.body);
       }
@@ -4465,9 +6015,18 @@ async function handle(req, res) {
       return;
     }
 
+    if (routePath === "/direct-admin/api/oauth/stop" && req.method === "POST") {
+      stopDirectOAuthSession("stopped");
+      const response = json(200, { ok: true, session: getOAuthSessionSnapshot() });
+      res.writeHead(response.status, response.headers);
+      res.end(response.body);
+      return;
+    }
+
     if (routePath === "/direct-admin/api/oauth/start" && req.method === "POST") {
       try {
-        const result = await startDirectOAuthSession();
+        const body = await readRequestBody(req).catch(() => ({}));
+        const result = await startDirectOAuthSession({ force: body?.force === true });
         const response = json(200, result);
         res.writeHead(response.status, response.headers);
         res.end(response.body);
@@ -4566,7 +6125,7 @@ async function handle(req, res) {
         return;
       }
 
-      const model = normalizeDirectModel(body?.model || "composer-2-fast");
+      const model = normalizeDirectModel(body?.model || DEFAULT_CURSOR_DIRECT_MODEL);
       const prompt = "Reply with EXACTLY DIRECT_ADMIN_OK and no other text.";
       const started = Date.now();
       const finishRequest = beginTrackedRequest(model, prompt.length);
@@ -4631,7 +6190,17 @@ async function handle(req, res) {
           error: error instanceof Error ? error.message : String(error),
         });
       }
-      const codeBuddyModels = listConfiguredCodeBuddyModels();
+      let codeBuddyModels = listConfiguredCodeBuddyModels();
+      try {
+        const listed = await listCodeBuddyModelsForAdmin();
+        if (Array.isArray(listed?.models) && listed.models.length > 0) {
+          codeBuddyModels = listed.models;
+        }
+      } catch (error) {
+        log("warn", "codebuddy model list unavailable while building proxy model list", {
+          error: error instanceof Error ? error.message : String(error),
+        });
+      }
       const response = json(200, {
         object: "list",
         data: [
@@ -4707,204 +6276,19 @@ async function handle(req, res) {
     const rawRequestedModel = typeof body?.model === "string" && body.model.trim() ? body.model.trim() : "claude-sonnet-4-5";
     const providerModel = resolveGatewayProviderModel(rawRequestedModel);
     if (providerModel.provider === "codebuddy") {
-      const requestedModel = providerModel.publicModel;
-      const claudeToolOptions = { tools: body?.tools, toolChoice: body?.tool_choice };
-      const prompt = buildPromptFromClaudeMessages(messages, body?.system, claudeToolOptions);
-      const streamRequested = body?.stream === true;
-      const finishRequest = beginTrackedRequest(requestedModel, prompt.length, { stream: streamRequested });
-      log("info", "codebuddy claude messages request", {
+      log("info", "rejected codebuddy claude messages request", {
         model: providerModel.model,
-        requestedModel,
-        stream: streamRequested,
+        requestedModel: providerModel.publicModel,
+        stream: body?.stream === true,
         messages: messages.length,
-        promptChars: prompt.length,
         userAgent: String(req.headers["user-agent"] || "").slice(0, 120),
       });
-
-      if (streamRequested) {
-        const id = `msg_codebuddy_${Date.now()}`;
-        const controller = new AbortController();
-        let responseStarted = false;
-        let responseDone = false;
-        let textBlockStarted = false;
-        let textBlockStopped = false;
-        let streamedChars = 0;
-        let nextBlockIndex = 0;
-
-        const writeClaudeEvent = (event, payload) => {
-          res.write(createClaudeStreamEvent(event, payload));
-        };
-        const startMessage = () => {
-          if (responseStarted || res.destroyed) return;
-          responseStarted = true;
-          res.writeHead(200, {
-            "content-type": "text/event-stream; charset=utf-8",
-            "cache-control": "no-cache",
-            connection: "keep-alive",
-            "x-accel-buffering": "no",
-            "access-control-allow-origin": "*",
-          });
-          writeClaudeEvent("message_start", createClaudeMessageStreamEventsFromProviderTurn({ text: "", toolUses: [] }, {
-            id,
-            model: requestedModel,
-            prompt,
-          })[0].payload);
-          flushResponse(res);
-        };
-        const startTextBlock = () => {
-          startMessage();
-          if (textBlockStarted || res.destroyed) return;
-          textBlockStarted = true;
-          writeClaudeEvent("content_block_start", {
-            type: "content_block_start",
-            index: nextBlockIndex,
-            content_block: { type: "text", text: "" },
-          });
-          flushResponse(res);
-        };
-        const stopTextBlock = () => {
-          if (!textBlockStarted || textBlockStopped || res.destroyed) return;
-          textBlockStopped = true;
-          writeClaudeEvent("content_block_stop", {
-            type: "content_block_stop",
-            index: nextBlockIndex,
-          });
-          nextBlockIndex += 1;
-        };
-        const writeToolUses = (toolUses) => {
-          for (const tool of toolUses) {
-            writeClaudeEvent("content_block_start", {
-              type: "content_block_start",
-              index: nextBlockIndex,
-              content_block: {
-                type: "tool_use",
-                id: tool.id,
-                name: tool.name || "tool",
-                input: {},
-              },
-            });
-            writeClaudeEvent("content_block_delta", {
-              type: "content_block_delta",
-              index: nextBlockIndex,
-              delta: {
-                type: "input_json_delta",
-                partial_json: JSON.stringify(tool.input || {}),
-              },
-            });
-            writeClaudeEvent("content_block_stop", {
-              type: "content_block_stop",
-              index: nextBlockIndex,
-            });
-            nextBlockIndex += 1;
-          }
-        };
-
-        const keepAliveMs = Math.max(0, Number(config.streamKeepAliveMs || 0));
-        const keepAliveTimer = keepAliveMs > 0
-          ? setInterval(() => {
-            if (!responseDone && responseStarted && !res.destroyed) {
-              writeClaudeEvent("ping", { type: "ping" });
-              flushResponse(res);
-            }
-          }, keepAliveMs)
-          : null;
-        const cancelOnClose = () => {
-          if (!responseDone) controller.abort();
-        };
-        res.on("close", cancelOnClose);
-
-        try {
-          startMessage();
-          const result = await runCodeBuddyCompletionFromPool([{ role: "user", content: prompt }], {
-            signal: controller.signal,
-            model: providerModel.model,
-            tools: body?.tools,
-            toolChoice: body?.tool_choice,
-            onDelta: (delta) => {
-              if (!delta || res.destroyed) return;
-              startTextBlock();
-              streamedChars += delta.length;
-              writeClaudeEvent("content_block_delta", {
-                type: "content_block_delta",
-                index: nextBlockIndex,
-                delta: { type: "text_delta", text: delta },
-              });
-              flushResponse(res);
-            },
-          });
-          if (keepAliveTimer) clearInterval(keepAliveTimer);
-          finishRequest(true, {
-            outputChars: result.turn.text.length,
-            upstreamBytes: result.bytes,
-            stringCount: result.eventCount,
-            deltaCount: result.deltaCount,
-          });
-          if (res.destroyed) return;
-          if (streamedChars === 0 && result.turn.text) {
-            startTextBlock();
-            streamedChars += result.turn.text.length;
-            writeClaudeEvent("content_block_delta", {
-              type: "content_block_delta",
-              index: nextBlockIndex,
-              delta: { type: "text_delta", text: result.turn.text },
-            });
-          }
-          stopTextBlock();
-          const toolUses = Array.isArray(result.turn.toolUses) ? result.turn.toolUses : [];
-          if (toolUses.length > 0) writeToolUses(toolUses);
-          writeClaudeEvent("message_delta", {
-            type: "message_delta",
-            delta: { stop_reason: toolUses.length > 0 ? "tool_use" : "end_turn", stop_sequence: null },
-            usage: estimateClaudeUsage(prompt, result.turn.text),
-          });
-          writeClaudeEvent("message_stop", { type: "message_stop" });
-          responseDone = true;
-          res.end();
-        } catch (error) {
-          if (keepAliveTimer) clearInterval(keepAliveTimer);
-          const message = error instanceof Error ? error.message : String(error);
-          finishRequest(false, { error: message });
-          if (res.destroyed) return;
-          startMessage();
-          writeClaudeEvent("error", {
-            type: "error",
-            error: { type: "api_error", message },
-          });
-          responseDone = true;
-          res.end();
-        } finally {
-          if (keepAliveTimer) clearInterval(keepAliveTimer);
-          res.off("close", cancelOnClose);
-        }
-        return;
-      }
-
-      try {
-        const result = await runCodeBuddyCompletionFromPool([{ role: "user", content: prompt }], {
-          model: providerModel.model,
-          tools: body?.tools,
-          toolChoice: body?.tool_choice,
-        });
-        finishRequest(true, {
-          outputChars: result.turn.text.length,
-          upstreamBytes: result.bytes,
-          stringCount: result.eventCount,
-          deltaCount: result.deltaCount,
-        });
-        const response = json(200, createClaudeMessageFromProviderTurn(result.turn, {
-          id: `msg_codebuddy_${Date.now()}`,
-          model: requestedModel,
-          prompt,
-        }));
-        res.writeHead(response.status, response.headers);
-        res.end(response.body);
-      } catch (error) {
-        const message = error instanceof Error ? error.message : String(error);
-        finishRequest(false, { error: message });
-        const response = openAiError(502, "upstream_error", message);
-        res.writeHead(response.status, response.headers);
-        res.end(response.body);
-      }
+      const response = openAiError(400,
+        "invalid_request_error",
+        "CodeBuddy models are only available through /v1/chat/completions so gateway prompt shims never touch CodeBuddy requests.",
+      );
+      res.writeHead(response.status, response.headers);
+      res.end(response.body);
       return;
     }
     const requestedModel = normalizePublicModelName(rawRequestedModel);
@@ -5037,6 +6421,7 @@ async function handle(req, res) {
           signal: controller.signal,
           tools: body?.tools,
           toolChoice: body?.tool_choice,
+          prompt,
           captureNativeToolUse: shouldBufferToolResponse,
           onDelta: (delta) => {
             if (!delta || res.destroyed) return;
@@ -5053,7 +6438,9 @@ async function handle(req, res) {
         });
         if (keepAliveTimer) clearInterval(keepAliveTimer);
         const toolUse = shouldBufferToolResponse
-          ? (result.toolUse || parseClaudeToolUse(result.text, claudeToolOptions))
+          ? (result.toolUse
+            || parseClaudeToolUse(result.text, claudeToolOptions)
+            || synthesizeForcedToolUse({ ...claudeToolOptions, prompt }))
           : null;
         finishRequest(true, {
           outputChars: result.text.length,
@@ -5100,6 +6487,7 @@ async function handle(req, res) {
       const result = await runDirectCompletionFromPool(prompt, model, {
         tools: body?.tools,
         toolChoice: body?.tool_choice,
+        prompt,
         captureNativeToolUse: shouldBufferToolResponse,
       });
       finishRequest(true, {
@@ -5169,6 +6557,7 @@ async function handle(req, res) {
         let responseStarted = false;
         let responseDone = false;
         let streamedChars = 0;
+        let streamedToolCallChunks = 0;
 
         const startStream = () => {
           if (responseStarted || res.destroyed) return;
@@ -5197,6 +6586,44 @@ async function handle(req, res) {
             })));
           });
         };
+        const writeToolCallDelta = (event) => {
+          if (!event || res.destroyed) return;
+          const index = Number.isInteger(event.index) ? event.index : 0;
+          const toolCall = { index };
+          if (event.id) {
+            toolCall.id = String(event.id);
+            toolCall.type = "function";
+          }
+          const fn = {};
+          if (event.name) fn.name = String(event.name);
+          if (typeof event.argumentsDelta === "string") fn.arguments = event.argumentsDelta;
+          if (Object.keys(fn).length > 0) toolCall.function = fn;
+          if (!toolCall.id && !toolCall.function) return;
+          startStream();
+          streamedToolCallChunks += 1;
+          res.write(sse(createOpenAIChatCompletionStreamChunk(id, providerModel.publicModel, {
+            tool_calls: [toolCall],
+          })));
+          flushResponse(res);
+        };
+        const writeToolUseAsDelta = (event) => {
+          if (!event || res.destroyed) return;
+          const index = Number.isInteger(event.index) ? event.index : streamedToolCallChunks;
+          startStream();
+          streamedToolCallChunks += 1;
+          res.write(sse(createOpenAIChatCompletionStreamChunk(id, providerModel.publicModel, {
+            tool_calls: [{
+              index,
+              id: event.id || `call_${randomUUID().replace(/-/g, "")}`,
+              type: "function",
+              function: {
+                name: event.name || "tool",
+                arguments: JSON.stringify(event.input || {}),
+              },
+            }],
+          })));
+          flushResponse(res);
+        };
         const keepAliveMs = Math.max(0, Number(config.streamKeepAliveMs || 0));
         const keepAliveTimer = keepAliveMs > 0
           ? setInterval(() => {
@@ -5217,6 +6644,10 @@ async function handle(req, res) {
             model: providerModel.model,
             tools: body?.tools,
             toolChoice: body?.tool_choice,
+            onEvent: (event) => {
+              if (event?.type === "tool_call_delta") writeToolCallDelta(event);
+              else if (event?.type === "tool_use") writeToolUseAsDelta(event);
+            },
             onDelta: (delta) => {
               if (!delta || res.destroyed) return;
               startStream();
@@ -5239,7 +6670,7 @@ async function handle(req, res) {
             res.write(sse(createOpenAIChatCompletionStreamChunk(id, providerModel.publicModel, { content: result.turn.text })));
           }
           const toolUses = Array.isArray(result.turn.toolUses) ? result.turn.toolUses : [];
-          if (toolUses.length > 0) writeToolCallChunks(toolUses);
+          if (toolUses.length > 0 && streamedToolCallChunks === 0) writeToolCallChunks(toolUses);
           res.write(sse(createOpenAIChatCompletionStreamChunk(
             id,
             providerModel.publicModel,
@@ -5301,23 +6732,29 @@ async function handle(req, res) {
       return;
     }
     const model = normalizeDirectModel(body?.model);
-    const prompt = buildPromptFromMessages(messages);
+    const publicModel = displayModelId(model);
+    const directToolOptions = getDirectToolOptions(body);
+    const prompt = buildPromptFromOpenAiMessages(messages, directToolOptions);
+    const shouldBufferToolResponse = shouldAttemptDirectToolUse(directToolOptions);
     const streamRequested = body?.stream === true;
     const finishRequest = beginTrackedRequest(model, prompt.length, { stream: streamRequested });
     log("info", "chat completion request", {
-      model: displayModelId(model),
+      model: publicModel,
       stream: streamRequested,
       messages: messages.length,
       promptChars: prompt.length,
+      tools: directToolOptions.tools.length,
+      toolChoice: directToolOptions.toolChoice?.type || "none",
       userAgent: String(req.headers["user-agent"] || "").slice(0, 120),
     });
 
     if (streamRequested) {
-      const id = `cursor-direct-${Date.now()}`;
+      const id = `chatcmpl_${Date.now()}`;
       const controller = new AbortController();
       let responseStarted = false;
       let responseDone = false;
       let streamedChars = 0;
+      let streamedToolCallChunks = 0;
 
       const startStream = () => {
         if (responseStarted || res.destroyed) return;
@@ -5328,8 +6765,27 @@ async function handle(req, res) {
           connection: "keep-alive",
           "access-control-allow-origin": "*",
         });
-        res.write(sse(createChunk(id, model, { role: "assistant" })));
+        res.write(sse(createOpenAIChatCompletionStreamChunk(id, publicModel, { role: "assistant" })));
         flushResponse(res);
+      };
+
+      const writeToolCallChunks = (toolUses) => {
+        toolUses.forEach((tool, index) => {
+          startStream();
+          streamedToolCallChunks += 1;
+          res.write(sse(createOpenAIChatCompletionStreamChunk(id, publicModel, {
+            tool_calls: [{
+              index,
+              id: tool.id || `call_${randomUUID().replace(/-/g, "")}`,
+              type: "function",
+              function: {
+                name: tool.name || "tool",
+                arguments: JSON.stringify(tool.input || {}),
+              },
+            }],
+          })));
+          flushResponse(res);
+        });
       };
 
       const keepAliveMs = Math.max(0, config.streamKeepAliveMs);
@@ -5348,27 +6804,38 @@ async function handle(req, res) {
       res.on("close", cancelOnClose);
 
       try {
-        const result = await runDirectCompletionFromPool(prompt, model, {
-          signal: controller.signal,
-          onDelta: (delta) => {
-            if (!delta || res.destroyed) return;
-            startStream();
-            streamedChars += delta.length;
-            res.write(sse(createChunk(id, model, { content: delta })));
-            flushResponse(res);
-          },
-        });
+        if (shouldBufferToolResponse) startStream();
+        const pooled = shouldBufferToolResponse
+          ? await runDirectPoolWithToolFallback(prompt, model, directToolOptions, { signal: controller.signal })
+          : {
+            result: await runDirectCompletionFromPool(prompt, model, {
+              signal: controller.signal,
+              prompt,
+              onDelta: (delta) => {
+                if (!delta || res.destroyed) return;
+                startStream();
+                streamedChars += delta.length;
+                res.write(sse(createOpenAIChatCompletionStreamChunk(id, publicModel, { content: delta })));
+                flushResponse(res);
+              },
+            }),
+            toolUse: null,
+          };
+        const result = pooled.result;
         if (keepAliveTimer) clearInterval(keepAliveTimer);
+        const toolUse = pooled.toolUse;
+        const turn = createDirectProviderTurn(result, toolUse, prompt);
         finishRequest(true, {
-          outputChars: result.text.length,
+          outputChars: (turn.text || "").length,
           upstreamBytes: result.bytes,
           stringCount: result.stringCount,
           deltaCount: result.deltaCount,
         });
         log("info", "chat completion response", {
-          model: displayModelId(model),
+          model: publicModel,
           stream: true,
-          outputChars: result.text.length,
+          outputChars: (turn.text || "").length,
+          toolCalls: turn.toolUses.length,
           upstreamBytes: result.bytes,
           stringCount: result.stringCount,
           deltaCount: result.deltaCount,
@@ -5377,12 +6844,17 @@ async function handle(req, res) {
           accountId: result.accountId || "",
         });
         if (res.destroyed) return;
-        startStream();
-        if (streamedChars === 0 && result.text) {
-          streamedChars += result.text.length;
-          res.write(sse(createChunk(id, model, { content: result.text })));
+        if (turn.toolUses.length > 0) {
+          if (streamedToolCallChunks === 0) writeToolCallChunks(turn.toolUses);
+          res.write(sse(createOpenAIChatCompletionStreamChunk(id, publicModel, {}, "tool_calls")));
+        } else {
+          startStream();
+          if (streamedChars === 0 && turn.text) {
+            streamedChars += turn.text.length;
+            res.write(sse(createOpenAIChatCompletionStreamChunk(id, publicModel, { content: turn.text })));
+          }
+          res.write(sse(createOpenAIChatCompletionStreamChunk(id, publicModel, {}, "stop")));
         }
-        res.write(sse(createChunk(id, model, {}, true)));
         res.write("data: [DONE]\n\n");
         responseDone = true;
         res.end();
@@ -5410,17 +6882,23 @@ async function handle(req, res) {
     }
 
     try {
-      const result = await runDirectCompletionFromPool(prompt, model);
+      const pooled = shouldBufferToolResponse
+        ? await runDirectPoolWithToolFallback(prompt, model, directToolOptions)
+        : { result: await runDirectCompletionFromPool(prompt, model, { prompt }), toolUse: null };
+      const result = pooled.result;
+      const toolUse = pooled.toolUse;
+      const turn = createDirectProviderTurn(result, toolUse, prompt);
       finishRequest(true, {
-        outputChars: result.text.length,
+        outputChars: (turn.text || "").length,
         upstreamBytes: result.bytes,
         stringCount: result.stringCount,
         deltaCount: result.deltaCount,
       });
       log("info", "chat completion response", {
-        model: displayModelId(model),
+        model: publicModel,
         stream: false,
-        outputChars: result.text.length,
+        outputChars: (turn.text || "").length,
+        toolCalls: turn.toolUses.length,
         upstreamBytes: result.bytes,
         stringCount: result.stringCount,
         deltaCount: result.deltaCount,
@@ -5428,7 +6906,11 @@ async function handle(req, res) {
         accountId: result.accountId || "",
       });
 
-      const response = json(200, createChatCompletion(model, result.text, prompt));
+      const response = json(200, createOpenAIChatCompletionFromProviderTurn(turn, {
+        id: `chatcmpl_${Date.now()}`,
+        model: publicModel,
+        prompt,
+      }));
       res.writeHead(response.status, response.headers);
       res.end(response.body);
     } catch (error) {
@@ -5438,6 +6920,7 @@ async function handle(req, res) {
       res.writeHead(response.status, response.headers);
       res.end(response.body);
     }
+    return;
     return;
   }
 
@@ -5454,6 +6937,12 @@ export {
   buildClaudeToolsPrompt,
   buildPromptFromClaudeMessages,
   buildPromptFromMessages,
+  buildPromptFromOpenAiMessages,
+  buildOpenAiToolsPrompt,
+  getDirectToolOptions,
+  shouldAttemptDirectToolUse,
+  resolveDirectToolUse,
+  createDirectProviderTurn,
   createLegacyDirectAccount,
   createAssistantTextAccumulator,
   createClaudeMessageStartPayload,
@@ -5475,10 +6964,13 @@ export {
   isDirectAdminAuthorized,
   listDirectModels,
   normalizeApiPath,
+  normalizeCodeBuddyCredentialImportRequest,
+  DEFAULT_CURSOR_DIRECT_MODEL,
   normalizeDirectModel,
   normalizePublicModelName,
   normalizeCodeBuddyLoginStatus,
   parseClaudeToolUse,
+  parseCodeBuddyGatewayCredentialInput,
   parseCodeBuddyOAuthCallbackUrl,
   pickAssistantCandidate,
   pickAssistantText,
@@ -5486,7 +6978,6 @@ export {
   runDirectCompletionWithRetry,
   selectDirectAccount,
   setMetadataCache,
-  summarizeCodeBuddyLoginResponse,
   summarizeCursorAuth,
   summarizeDirectAccount,
   runDirectCompletion,
