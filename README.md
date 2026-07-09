@@ -127,7 +127,7 @@ curl http://127.0.0.1:32126/v1/models/codebuddy%2Fauto \
 }
 ```
 
-有 OAuth 账号时，列表会尽量来自协议 `/v3/config`；否则至少返回 `codebuddy/auto`。
+有 OAuth 账号时，列表会尽量来自协议 `/v3/config`；国际站 `/v3/config` 常空时会合并 CLI 模型目录（gpt / gemini 等）。否则至少返回 `codebuddy/auto`（上游映射为 `default-model`）。
 
 ```bash
 curl http://127.0.0.1:32126/v1/chat/completions \
@@ -135,6 +135,34 @@ curl http://127.0.0.1:32126/v1/chat/completions \
   -H "Content-Type: application/json" \
   -d '{"model":"codebuddy/auto","messages":[{"role":"user","content":"你好"}]}'
 ```
+
+---
+
+## 国内 / 国际
+
+同一仓库，靠 `.env` + 账号 `site` 切换；**JWT 不可混用**。
+
+国内（默认）：
+
+```text
+CURSOR_DIRECT_CODEBUDDY_SITE=domestic
+CURSOR_DIRECT_CODEBUDDY_INTERNET_ENVIRONMENT=internal
+CURSOR_DIRECT_CODEBUDDY_BASE_URL=https://www.codebuddy.cn
+```
+
+国际：
+
+```text
+CURSOR_DIRECT_CODEBUDDY_SITE=global
+CURSOR_DIRECT_CODEBUDDY_INTERNET_ENVIRONMENT=public
+CURSOR_DIRECT_CODEBUDDY_BASE_URL=https://www.codebuddy.ai
+```
+
+注意：
+
+- 国际「活动赠送包」常能看积分但 chat 报 `11140` → 换 Pro 试用/付费号
+- Sub2API 只发 `"hi"` 探活：网关会自动补 system，避免 `11101`
+- `11101` 不当作换号；`11140` 多半是套餐权限
 
 ---
 
