@@ -3,62 +3,55 @@
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <title>Cursor Proxy — 自建 OpenAI 兼容网关</title>
-  <meta name="description" content="Cursor Proxy：把 Cursor Direct 与 CodeBuddy 协议直连收成一套可自建的 OpenAI 兼容 /v1 网关，含管理台、账号池与 NewAPI 接入。" />
-  <meta property="og:title" content="Cursor Proxy" />
-  <meta property="og:description" content="自建 OpenAI 兼容网关 · Cursor Direct · CodeBuddy 协议直连" />
+  <title>CodeBuddy Proxy — CodeBuddy 的 OpenAI 兼容反代</title>
+  <meta name="description" content="CodeBuddy Proxy：专注 CodeBuddy 的自建反代。协议直连、OAuth、账号池、真实 Credits、OpenAI 兼容 /v1，可接 NewAPI。" />
+  <meta property="og:title" content="CodeBuddy Proxy" />
+  <meta property="og:description" content="把 CodeBuddy 变成 OpenAI 兼容的 /v1 渠道。只做 CodeBuddy，不做多厂商聚合。" />
   <meta property="og:type" content="website" />
+  <link rel="icon" href="./logo.svg" type="image/svg+xml" />
   <link rel="preconnect" href="https://fonts.googleapis.com" />
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
-  <link href="https://fonts.googleapis.com/css2?family=Instrument+Serif:ital@0;1&family=DM+Sans:ital,opsz,wght@0,9..40,400;0,9..40,500;0,9..40,600;0,9..40,700;1,9..40,400&display=swap" rel="stylesheet" />
+  <link href="https://fonts.googleapis.com/css2?family=Fraunces:opsz,wght@9..144,500;9..144,600;9..144,700&family=Sora:wght@400;500;600;700&display=swap" rel="stylesheet" />
   <style>
     :root {
-      --ink: #12140f;
-      --ink-soft: #3a4034;
-      --paper: #f3efe4;
-      --paper-deep: #e6e0d0;
-      --line: rgba(18, 20, 15, 0.12);
-      --accent: #c45c26;
-      --accent-deep: #9a3f12;
-      --mint: #2f6b5a;
-      --glow: rgba(196, 92, 38, 0.18);
-      --max: 1120px;
-      --font-display: "Instrument Serif", Georgia, serif;
-      --font-body: "DM Sans", "Segoe UI", sans-serif;
+      --bg: #0e1110;
+      --bg-elev: #161b19;
+      --ink: #f2efe6;
+      --muted: #9aa39a;
+      --line: rgba(242, 239, 230, 0.1);
+      --accent: #e88a4a;
+      --teal: #5ec4a8;
+      --max: 1080px;
+      --display: "Fraunces", Georgia, serif;
+      --sans: "Sora", system-ui, sans-serif;
     }
-
     * { box-sizing: border-box; margin: 0; padding: 0; }
     html { scroll-behavior: smooth; }
     body {
-      font-family: var(--font-body);
+      font-family: var(--sans);
+      background: var(--bg);
       color: var(--ink);
-      background: var(--paper);
       line-height: 1.55;
       overflow-x: hidden;
     }
     a { color: inherit; text-decoration: none; }
-    img { max-width: 100%; display: block; }
+    .wrap { width: min(100% - 2rem, var(--max)); margin-inline: auto; }
 
-    .grain {
+    .noise {
       pointer-events: none;
       position: fixed;
       inset: 0;
-      z-index: 50;
-      opacity: 0.045;
-      background-image: url("data:image/svg+xml,%3Csvg viewBox='0 0 200 200' xmlns='http://www.w3.org/2000/svg'%3E%3Cfilter id='n'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='0.85' numOctaves='4' stitchTiles='stitch'/%3E%3C/filter%3E%3Crect width='100%25' height='100%25' filter='url(%23n)'/%3E%3C/svg%3E");
+      z-index: 40;
+      opacity: 0.04;
+      background-image: url("data:image/svg+xml,%3Csvg viewBox='0 0 200 200' xmlns='http://www.w3.org/2000/svg'%3E%3Cfilter id='n'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='0.9' numOctaves='3' stitchTiles='stitch'/%3E%3C/filter%3E%3Crect width='100%25' height='100%25' filter='url(%23n)'/%3E%3C/svg%3E");
     }
 
-    .wrap {
-      width: min(100% - 2.5rem, var(--max));
-      margin-inline: auto;
-    }
-
-    /* —— Nav —— */
+    /* nav */
     .nav {
       position: absolute;
-      top: 0; left: 0; right: 0;
-      z-index: 10;
-      padding: 1.35rem 0;
+      inset: 0 0 auto;
+      z-index: 5;
+      padding: 1.25rem 0;
     }
     .nav-inner {
       display: flex;
@@ -66,424 +59,358 @@
       justify-content: space-between;
       gap: 1rem;
     }
-    .nav-brand {
-      font-family: var(--font-display);
-      font-size: 1.35rem;
+    .brand {
+      display: inline-flex;
+      align-items: center;
+      gap: 0.65rem;
+      font-weight: 600;
       letter-spacing: -0.02em;
     }
+    .brand img { width: 28px; height: 28px; }
     .nav-links {
       display: flex;
-      gap: 1.25rem;
+      gap: 1.1rem;
       align-items: center;
-      font-size: 0.9rem;
+      color: var(--muted);
+      font-size: 0.88rem;
       font-weight: 500;
-      color: var(--ink-soft);
     }
     .nav-links a:hover { color: var(--ink); }
-    .nav-cta {
-      padding: 0.55rem 0.95rem;
-      border: 1px solid var(--ink);
+    .pill {
+      padding: 0.5rem 0.9rem;
+      border: 1px solid var(--line);
       border-radius: 999px;
       color: var(--ink) !important;
-      transition: background 0.25s ease, color 0.25s ease;
+      transition: border-color .2s, background .2s;
     }
-    .nav-cta:hover {
-      background: var(--ink);
-      color: var(--paper) !important;
-    }
+    .pill:hover { border-color: rgba(242,239,230,.35); background: rgba(255,255,255,.04); }
 
-    /* —— Hero —— */
+    /* hero — one composition */
     .hero {
       position: relative;
       min-height: 100svh;
       display: grid;
       align-items: end;
-      padding: 7.5rem 0 4.5rem;
+      padding: 7rem 0 4.25rem;
       isolation: isolate;
       overflow: hidden;
     }
-    .hero-bg {
+    .hero-plane {
       position: absolute;
       inset: 0;
       z-index: -1;
       background:
-        radial-gradient(ellipse 70% 55% at 78% 18%, rgba(196, 92, 38, 0.28), transparent 55%),
-        radial-gradient(ellipse 50% 45% at 12% 70%, rgba(47, 107, 90, 0.18), transparent 50%),
-        linear-gradient(165deg, #f7f3e8 0%, #ebe4d2 42%, #ddd4be 100%);
+        radial-gradient(ellipse 55% 50% at 85% 15%, rgba(232,138,74,.28), transparent 55%),
+        radial-gradient(ellipse 45% 40% at 8% 85%, rgba(94,196,168,.14), transparent 50%),
+        linear-gradient(160deg, #0e1110 0%, #121816 45%, #0c0f0e 100%);
     }
-    .hero-grid {
+    .hero-plane::after {
+      content: "";
       position: absolute;
       inset: 0;
-      z-index: -1;
-      background-image:
-        linear-gradient(rgba(18,20,15,0.045) 1px, transparent 1px),
-        linear-gradient(90deg, rgba(18,20,15,0.045) 1px, transparent 1px);
-      background-size: 64px 64px;
-      mask-image: radial-gradient(ellipse 80% 70% at 50% 40%, #000 20%, transparent 75%);
-      animation: gridDrift 28s linear infinite;
+      background:
+        linear-gradient(rgba(242,239,230,.035) 1px, transparent 1px),
+        linear-gradient(90deg, rgba(242,239,230,.035) 1px, transparent 1px);
+      background-size: 72px 72px;
+      mask-image: radial-gradient(ellipse 75% 65% at 60% 35%, #000 10%, transparent 70%);
+      animation: drift 32s linear infinite;
     }
-    @keyframes gridDrift {
-      from { transform: translateY(0); }
-      to { transform: translateY(64px); }
+    @keyframes drift {
+      from { transform: translate3d(0,0,0); }
+      to { transform: translate3d(0,72px,0); }
     }
-    .hero-orb {
-      position: absolute;
-      width: min(52vw, 520px);
-      aspect-ratio: 1;
-      border-radius: 50%;
-      right: -6%;
-      top: 12%;
-      z-index: -1;
-      background: conic-gradient(from 210deg, rgba(196,92,38,0.35), rgba(47,107,90,0.2), rgba(196,92,38,0.05), rgba(196,92,38,0.35));
-      filter: blur(2px);
-      opacity: 0.55;
-      animation: orbSpin 40s linear infinite;
-    }
-    @keyframes orbSpin {
-      from { transform: rotate(0deg); }
-      to { transform: rotate(360deg); }
-    }
-
-    .hero-brand {
-      font-family: var(--font-display);
-      font-size: clamp(3.6rem, 11vw, 7.2rem);
-      line-height: 0.92;
-      letter-spacing: -0.035em;
-      max-width: 11ch;
-      margin-bottom: 1.35rem;
+    .hero h1 {
+      font-family: var(--display);
+      font-weight: 600;
+      font-size: clamp(3.2rem, 10vw, 6.4rem);
+      line-height: 0.95;
+      letter-spacing: -0.04em;
+      max-width: 10ch;
+      margin-bottom: 1.15rem;
       opacity: 0;
-      transform: translateY(28px);
-      animation: riseIn 0.9s cubic-bezier(0.22, 1, 0.36, 1) 0.1s forwards;
+      transform: translateY(24px);
+      animation: up .85s cubic-bezier(.22,1,.36,1) .08s forwards;
     }
-    .hero-brand em {
+    .hero h1 span {
+      display: block;
+      color: var(--accent);
       font-style: italic;
-      color: var(--accent-deep);
+      font-weight: 500;
     }
     .hero-lead {
-      font-size: clamp(1.05rem, 2.2vw, 1.25rem);
-      color: var(--ink-soft);
-      max-width: 34rem;
-      margin-bottom: 2rem;
+      max-width: 32rem;
+      color: var(--muted);
+      font-size: clamp(1rem, 2vw, 1.15rem);
+      margin-bottom: 1.85rem;
       opacity: 0;
-      transform: translateY(22px);
-      animation: riseIn 0.9s cubic-bezier(0.22, 1, 0.36, 1) 0.28s forwards;
+      transform: translateY(20px);
+      animation: up .85s cubic-bezier(.22,1,.36,1) .22s forwards;
     }
     .hero-actions {
       display: flex;
       flex-wrap: wrap;
-      gap: 0.75rem;
+      gap: .7rem;
       opacity: 0;
-      transform: translateY(18px);
-      animation: riseIn 0.9s cubic-bezier(0.22, 1, 0.36, 1) 0.42s forwards;
+      transform: translateY(16px);
+      animation: up .85s cubic-bezier(.22,1,.36,1) .36s forwards;
     }
-    @keyframes riseIn {
-      to { opacity: 1; transform: translateY(0); }
-    }
+    @keyframes up { to { opacity: 1; transform: none; } }
 
     .btn {
       display: inline-flex;
       align-items: center;
       justify-content: center;
-      gap: 0.4rem;
-      padding: 0.85rem 1.25rem;
+      padding: .85rem 1.2rem;
       border-radius: 999px;
       font-weight: 600;
-      font-size: 0.95rem;
-      transition: transform 0.2s ease, background 0.2s ease, color 0.2s ease, border-color 0.2s ease;
+      font-size: .92rem;
+      transition: transform .2s, background .2s, border-color .2s;
     }
     .btn:hover { transform: translateY(-1px); }
-    .btn-primary {
+    .btn-solid {
       background: var(--ink);
-      color: var(--paper);
-      border: 1px solid var(--ink);
+      color: var(--bg);
     }
-    .btn-primary:hover { background: #000; }
-    .btn-ghost {
-      background: transparent;
+    .btn-solid:hover { background: #fff; }
+    .btn-line {
       border: 1px solid var(--line);
       color: var(--ink);
     }
-    .btn-ghost:hover {
-      border-color: var(--ink);
-      background: rgba(255,255,255,0.35);
-    }
+    .btn-line:hover { border-color: rgba(242,239,230,.4); }
 
-    /* —— Sections —— */
     section {
-      padding: 5.5rem 0;
+      padding: 5rem 0;
       border-top: 1px solid var(--line);
     }
-    .section-kicker {
-      font-size: 0.78rem;
+    .kicker {
+      font-size: .72rem;
       font-weight: 600;
-      letter-spacing: 0.14em;
+      letter-spacing: .16em;
       text-transform: uppercase;
-      color: var(--mint);
-      margin-bottom: 0.85rem;
+      color: var(--teal);
+      margin-bottom: .75rem;
     }
-    .section-title {
-      font-family: var(--font-display);
-      font-size: clamp(2.1rem, 4.5vw, 3.1rem);
-      line-height: 1.05;
-      letter-spacing: -0.02em;
-      margin-bottom: 0.85rem;
-      max-width: 16ch;
+    .title {
+      font-family: var(--display);
+      font-size: clamp(2rem, 4.2vw, 2.85rem);
+      line-height: 1.08;
+      letter-spacing: -0.03em;
+      margin-bottom: .75rem;
+      max-width: 14ch;
     }
-    .section-desc {
-      color: var(--ink-soft);
-      max-width: 36rem;
-      margin-bottom: 2.5rem;
-      font-size: 1.05rem;
+    .desc {
+      color: var(--muted);
+      max-width: 34rem;
+      margin-bottom: 2.25rem;
+      font-size: 1.02rem;
     }
 
-    .feature-list {
+    .rails {
       display: grid;
       gap: 0;
       border-top: 1px solid var(--line);
     }
-    .feature-row {
+    .rail {
       display: grid;
-      grid-template-columns: 4.5rem 1fr;
-      gap: 1.25rem;
-      padding: 1.45rem 0;
+      grid-template-columns: 3.5rem 1fr;
+      gap: 1rem;
+      padding: 1.35rem 0;
       border-bottom: 1px solid var(--line);
-      align-items: start;
     }
-    .feature-idx {
-      font-family: var(--font-display);
-      font-size: 1.5rem;
+    .rail b {
+      font-family: var(--display);
+      font-size: 1.35rem;
       color: var(--accent);
-      line-height: 1;
-      padding-top: 0.15rem;
+      font-weight: 500;
     }
-    .feature-row h3 {
-      font-size: 1.15rem;
+    .rail h3 {
+      font-size: 1.05rem;
       font-weight: 600;
-      margin-bottom: 0.35rem;
+      margin-bottom: .3rem;
       letter-spacing: -0.01em;
     }
-    .feature-row p {
-      color: var(--ink-soft);
-      max-width: 40rem;
-      font-size: 0.98rem;
-    }
+    .rail p { color: var(--muted); font-size: .95rem; max-width: 38rem; }
 
     .split {
       display: grid;
-      grid-template-columns: 1fr 1fr;
-      gap: 3rem;
-      align-items: start;
+      grid-template-columns: 1.05fr .95fr;
+      gap: 2.5rem;
+      align-items: center;
     }
-    @media (max-width: 820px) {
-      .split { grid-template-columns: 1fr; gap: 2rem; }
-      .nav-links a:not(.nav-cta) { display: none; }
-    }
-
-    .stack-block {
-      padding: 1.5rem 0 0;
-    }
-    .stack-block h3 {
-      font-size: 1.05rem;
-      margin-bottom: 0.65rem;
-    }
-    .stack-block ul {
-      list-style: none;
-      display: grid;
-      gap: 0.55rem;
-    }
-    .stack-block li {
-      padding-left: 1.1rem;
-      position: relative;
-      color: var(--ink-soft);
-      font-size: 0.98rem;
-    }
-    .stack-block li::before {
-      content: "";
-      position: absolute;
-      left: 0;
-      top: 0.55em;
-      width: 0.45rem;
-      height: 0.45rem;
-      border-radius: 50%;
-      background: var(--accent);
+    @media (max-width: 840px) {
+      .split { grid-template-columns: 1fr; }
+      .nav-links a:not(.pill) { display: none; }
     }
 
-    .code-panel {
-      background: var(--ink);
-      color: #e8e2d4;
-      padding: 1.35rem 1.4rem;
-      border-radius: 4px;
+    .panel {
+      background: var(--bg-elev);
+      border: 1px solid var(--line);
+      border-radius: 14px;
+      padding: 1.25rem 1.3rem;
       font-family: ui-monospace, "Cascadia Code", Consolas, monospace;
-      font-size: 0.82rem;
-      line-height: 1.65;
+      font-size: .8rem;
+      line-height: 1.7;
+      color: #d8d3c6;
       overflow-x: auto;
-      box-shadow: 0 18px 40px rgba(18, 20, 15, 0.18);
     }
-    .code-panel .cmt { color: #8a8578; }
-    .code-panel .hl { color: #f0a06a; }
+    .panel .dim { color: #6f766f; }
+    .panel .hot { color: var(--accent); }
+
+    .note {
+      margin-top: 1.25rem;
+      padding: 1rem 1.1rem;
+      border-left: 3px solid var(--accent);
+      background: rgba(232,138,74,.08);
+      color: var(--muted);
+      font-size: .92rem;
+      max-width: 36rem;
+    }
+    .note strong { color: var(--ink); font-weight: 600; }
 
     .cta {
       background:
-        radial-gradient(ellipse 60% 80% at 100% 0%, rgba(196,92,38,0.2), transparent 55%),
-        linear-gradient(180deg, #ebe4d2, #e0d7c2);
-      text-align: left;
+        radial-gradient(ellipse 50% 80% at 100% 0%, rgba(232,138,74,.16), transparent 55%),
+        var(--bg);
     }
-    .cta .section-title { max-width: 18ch; }
-    .cta-actions {
+    .cta .title { max-width: 16ch; }
+    .cta-row {
       display: flex;
       flex-wrap: wrap;
-      gap: 0.75rem;
-      margin-top: 1.75rem;
+      gap: .7rem;
+      margin-top: 1.5rem;
     }
 
     footer {
-      padding: 2.25rem 0 3rem;
+      padding: 2rem 0 2.75rem;
       border-top: 1px solid var(--line);
-      color: var(--ink-soft);
-      font-size: 0.88rem;
+      color: var(--muted);
+      font-size: .85rem;
     }
-    .footer-inner {
+    .foot {
       display: flex;
       flex-wrap: wrap;
       justify-content: space-between;
-      gap: 1rem;
+      gap: .8rem;
     }
     footer a { text-decoration: underline; text-underline-offset: 3px; }
     footer a:hover { color: var(--ink); }
 
     @media (prefers-reduced-motion: reduce) {
-      *, *::before, *::after {
-        animation: none !important;
-        transition: none !important;
-      }
-      .hero-brand, .hero-lead, .hero-actions {
-        opacity: 1;
-        transform: none;
-      }
+      *, *::before, *::after { animation: none !important; transition: none !important; }
+      .hero h1, .hero-lead, .hero-actions { opacity: 1; transform: none; }
     }
   </style>
 </head>
 <body>
-  <div class="grain" aria-hidden="true"></div>
+  <div class="noise" aria-hidden="true"></div>
 
   <header class="nav">
     <div class="wrap nav-inner">
-      <a class="nav-brand" href="./">Cursor Proxy</a>
-      <nav class="nav-links" aria-label="主导航">
-        <a href="#features">能力</a>
-        <a href="#stack">架构</a>
+      <a class="brand" href="./">
+        <img src="./logo.svg" alt="" />
+        CodeBuddy Proxy
+      </a>
+      <nav class="nav-links" aria-label="导航">
+        <a href="#why">能力</a>
         <a href="#start">开始</a>
-        <a class="nav-cta" href="https://github.com/wnddd839/cursor-proxy" target="_blank" rel="noopener">GitHub</a>
+        <a class="pill" href="https://github.com/wnddd839/cursor-proxy" target="_blank" rel="noopener">GitHub</a>
       </nav>
     </div>
   </header>
 
   <main>
-    <section class="hero" aria-label="产品介绍">
-      <div class="hero-bg" aria-hidden="true"></div>
-      <div class="hero-grid" aria-hidden="true"></div>
-      <div class="hero-orb" aria-hidden="true"></div>
+    <section class="hero" aria-label="CodeBuddy Proxy">
+      <div class="hero-plane" aria-hidden="true"></div>
       <div class="wrap">
-        <h1 class="hero-brand">Cursor <em>Proxy</em></h1>
+        <h1>CodeBuddy <span>Proxy</span></h1>
         <p class="hero-lead">
-          自建 OpenAI 兼容网关。把 Cursor Direct 与 CodeBuddy 协议直连收成一套可部署的 `/v1` 服务，附带管理台与账号池。
+          专注 CodeBuddy 的自建反代。OAuth 登录后协议直连，对外给出标准 OpenAI 兼容 `/v1`，可直接接 NewAPI。
         </p>
         <div class="hero-actions">
-          <a class="btn btn-primary" href="https://github.com/wnddd839/cursor-proxy" target="_blank" rel="noopener">查看仓库</a>
-          <a class="btn btn-ghost" href="https://github.com/wnddd839/cursor-proxy#readme" target="_blank" rel="noopener">阅读 README</a>
+          <a class="btn btn-solid" href="https://github.com/wnddd839/cursor-proxy" target="_blank" rel="noopener">打开仓库</a>
+          <a class="btn btn-line" href="https://github.com/wnddd839/cursor-proxy#快速开始" target="_blank" rel="noopener">快速开始</a>
         </div>
       </div>
     </section>
 
-    <section id="features">
+    <section id="why">
       <div class="wrap">
-        <p class="section-kicker">Capabilities</p>
-        <h2 class="section-title">一套网关，两条上游</h2>
-        <p class="section-desc">面向自有账号授权场景：统一入口、统一鉴权、统一管理，再接到 NewAPI 或任意 OpenAI 兼容客户端。</p>
+        <p class="kicker">Only CodeBuddy</p>
+        <h2 class="title">一件事做到位</h2>
+        <p class="desc">不是多厂商聚合，也不是 Cursor 网关。这个项目只服务 CodeBuddy 账号 → OpenAI 兼容接口。</p>
 
-        <div class="feature-list">
-          <article class="feature-row">
-            <div class="feature-idx">01</div>
+        <div class="rails">
+          <article class="rail">
+            <b>01</b>
             <div>
-              <h3>OpenAI 兼容 `/v1`</h3>
-              <p>`GET /v1/models` 与 `POST /v1/chat/completions`，用熟悉的 Bearer Key 接入，无需改客户端协议。</p>
+              <h3>协议直连</h3>
+              <p>默认 protocol_direct。OAuth 后直连上游，模型列表走 /v3/config，不必再挂 CLI serve。</p>
             </div>
           </article>
-          <article class="feature-row">
-            <div class="feature-idx">02</div>
+          <article class="rail">
+            <b>02</b>
             <div>
-              <h3>Cursor Direct</h3>
-              <p>直连 Cursor 上游，账号池轮询，支持常用模型别名，适合把多个 Cursor 账号收成一个渠道。</p>
+              <h3>真实 Credits</h3>
+              <p>管理台读官网用量接口，展示剩余 / 总额。一眼知道账号还剩多少。</p>
             </div>
           </article>
-          <article class="feature-row">
-            <div class="feature-idx">03</div>
+          <article class="rail">
+            <b>03</b>
             <div>
-              <h3>CodeBuddy 协议直连</h3>
-              <p>默认 `protocol_direct`：OAuth 登录后走协议；模型列表来自 `/v3/config`；管理台展示官网真实 Credits（剩余 / 总额）。</p>
+              <h3>账号池 + 管理台</h3>
+              <p>多账号轮询、启用禁用、刷新 token。写盘有保护，刷新失败不会把账号列表清空。</p>
             </div>
           </article>
-          <article class="feature-row">
-            <div class="feature-idx">04</div>
+          <article class="rail">
+            <b>04</b>
             <div>
-              <h3>管理台与写盘保护</h3>
-              <p>`/direct-admin/` 完成认证、启用禁用、刷新与用量查询。账号池拒绝意外缩减，刷新失败只记错误不清空列表。</p>
+              <h3>OpenAI 形状</h3>
+              <p>GET /v1/models、POST /v1/chat/completions。NewAPI、自建客户端，按熟悉方式接入。</p>
             </div>
           </article>
         </div>
       </div>
     </section>
 
-    <section id="stack">
+    <section id="start">
       <div class="wrap split">
         <div>
-          <p class="section-kicker">Architecture</p>
-          <h2 class="section-title">为自建而生</h2>
-          <p class="section-desc">Node 直跑或 Docker Compose；Nginx 可统一暴露公网端口。默认 CodeBuddy 站点为国内站 codebuddy.cn。</p>
-          <div class="stack-block">
-            <h3>你得到什么</h3>
-            <ul>
-              <li>单一 `/v1` 入口，对接 NewAPI / 自有客户端</li>
-              <li>管理台品牌 CodeBuddy Proxy，OAuth 一键导入</li>
-              <li>systemd / Compose 部署文件开箱可用</li>
-              <li>密钥与账号文件默认不进仓库</li>
-            </ul>
+          <p class="kicker">Get started</p>
+          <h2 class="title">三步跑起来</h2>
+          <p class="desc">Node 20+。克隆、写密钥、npm start。默认国内站 codebuddy.cn。</p>
+          <div class="note">
+            <strong>范围说明：</strong>本项目只做 CodeBuddy 反代。仓库历史名仍为 cursor-proxy，产品本身已收敛为 CodeBuddy Proxy。
           </div>
         </div>
-        <div>
-          <pre class="code-panel" aria-label="调用示例"><code><span class="cmt"># 聊天请求</span>
-POST /v1/chat/completions
-Authorization: Bearer <span class="hl">&lt;API_KEY&gt;</span>
+        <pre class="panel" aria-label="启动命令"><code><span class="dim"># clone &amp; configure</span>
+git clone https://github.com/wnddd839/cursor-proxy.git
+cd cursor-proxy &amp;&amp; cp .env.example .env
 
-{
-  "model": "<span class="hl">codebuddy/auto</span>",
-  "messages": [
-    { "role": "user", "content": "你好" }
-  ]
-}
+<span class="dim"># start</span>
+npm start
 
-<span class="cmt"># 管理台</span>
-http://127.0.0.1:32126/direct-admin/</code></pre>
-        </div>
+<span class="dim"># endpoints</span>
+API    <span class="hot">http://127.0.0.1:32126/v1</span>
+Admin  <span class="hot">http://127.0.0.1:32126/direct-admin/</span></code></pre>
       </div>
     </section>
 
-    <section id="start" class="cta">
+    <section class="cta">
       <div class="wrap">
-        <p class="section-kicker">Get started</p>
-        <h2 class="section-title">克隆仓库，十分钟起服务</h2>
-        <p class="section-desc">需要 Node.js 20+。复制 `.env.example`，设置 API Key 与管理密码，然后 `npm start`。</p>
-        <div class="cta-actions">
-          <a class="btn btn-primary" href="https://github.com/wnddd839/cursor-proxy" target="_blank" rel="noopener">打开 GitHub</a>
-          <a class="btn btn-ghost" href="https://github.com/wnddd839/cursor-proxy/blob/main/README.md" target="_blank" rel="noopener">完整文档</a>
+        <p class="kicker">Ship it</p>
+        <h2 class="title">把 CodeBuddy 接到你的工具链</h2>
+        <p class="desc">管理台完成 OAuth，客户端只认 Base URL 和 API Key。完整说明见仓库 README。</p>
+        <div class="cta-row">
+          <a class="btn btn-solid" href="https://github.com/wnddd839/cursor-proxy" target="_blank" rel="noopener">GitHub</a>
+          <a class="btn btn-line" href="https://github.com/wnddd839/cursor-proxy#readme" target="_blank" rel="noopener">README</a>
         </div>
       </div>
     </section>
   </main>
 
   <footer>
-    <div class="wrap footer-inner">
-      <p>Cursor Proxy · BSD-3-Clause · 仅限授权与合规使用</p>
+    <div class="wrap foot">
+      <p>CodeBuddy Proxy · BSD-3-Clause · 仅限授权与合规使用</p>
       <p>
         <a href="https://github.com/wnddd839/cursor-proxy" target="_blank" rel="noopener">仓库</a>
         ·

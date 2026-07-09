@@ -1,7 +1,7 @@
 {
   "name": "cursor-proxy",
   "version": "0.2.0",
-  "description": "OpenAI-compatible gateway for Cursor Direct and CodeBuddy protocol proxy, with admin console, account pool, and NewAPI support.",
+  "description": "CodeBuddy Proxy — OpenAI-compatible reverse proxy for CodeBuddy (protocol direct, OAuth, account pool, admin).",
   "type": "module",
   "scripts": {
     "start": "node ./cursor-direct-gateway.mjs",
@@ -24,12 +24,12 @@
     "url": "https://github.com/wnddd839/cursor-proxy/issues"
   },
   "keywords": [
-    "cursor",
     "codebuddy",
     "proxy",
     "openai-compatible",
     "newapi",
     "gateway",
-    "docker"
+    "protocol-direct",
+    "oauth"
   ]
 }
