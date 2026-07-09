@@ -91,13 +91,43 @@ docker compose up -d --build
 
 ## 接入
 
-**任意 OpenAI 兼容客户端 / NewAPI**
+**任意 OpenAI 兼容客户端 / NewAPI / Sub2API**
 
 ```text
 Base URL   http://<host>:32126/v1
 API Key    与 .env 中 CURSOR_DIRECT_API_KEY 相同
-Model      codebuddy/auto  或管理台刷新出的模型名
+Model      codebuddy/auto  或 GET /v1/models 返回的 id
 ```
+
+下游可直接拉模型列表（标准 OpenAI Models API）：
+
+```bash
+# 列表
+curl http://127.0.0.1:32126/v1/models \
+  -H "Authorization: Bearer $CURSOR_DIRECT_API_KEY"
+
+# 单个模型
+curl http://127.0.0.1:32126/v1/models/codebuddy%2Fauto \
+  -H "Authorization: Bearer $CURSOR_DIRECT_API_KEY"
+```
+
+返回形如：
+
+```json
+{
+  "object": "list",
+  "data": [
+    {
+      "id": "codebuddy/auto",
+      "object": "model",
+      "created": 1700000000,
+      "owned_by": "codebuddy"
+    }
+  ]
+}
+```
+
+有 OAuth 账号时，列表会尽量来自协议 `/v3/config`；否则至少返回 `codebuddy/auto`。
 
 ```bash
 curl http://127.0.0.1:32126/v1/chat/completions \

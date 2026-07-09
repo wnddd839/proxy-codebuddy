@@ -1,6 +1,6 @@
 ﻿{
   "name": "proxy-codebuddy",
-  "version": "0.2.0",
+  "version": "0.2.1",
   "description": "CodeBuddy Proxy — OpenAI-compatible reverse proxy for CodeBuddy (protocol direct, OAuth, account pool, admin).",
   "type": "module",
   "scripts": {
@@ -9,7 +9,9 @@
     "start:cli": "node ./cursor-gateway.mjs",
     "gateway": "node ./cursor-gateway.mjs",
     "check": "node --check admin-shared.mjs && node --check direct-admin-page.mjs && node --check cursor-direct-gateway.mjs && node --check cursor-gateway.mjs && node --check provider-events.mjs && node --check codebuddy-provider.mjs && node --check codebuddy-account-pool.mjs && node --check codebuddy-oauth.mjs && node --check codebuddy-cli-daemon.mjs && node --check codebuddy-local-creds.mjs && node --check codebuddy-models.mjs && node --check direct-tool-bridge.mjs",
-    "test": "node --test tests/unit/cursor-direct-gateway.test.mjs tests/unit/cursor-gateway-admin.test.mjs tests/unit/codebuddy-account-pool.test.mjs"
+    "test": "node --test tests/unit/codebuddy-models.test.mjs tests/unit/codebuddy-account-pool.test.mjs",
+    "test:all": "node --test tests/unit/*.test.mjs",
+    "test:models": "node --test tests/unit/codebuddy-models.test.mjs"
   },
   "engines": {
     "node": ">=20"
@@ -28,6 +30,7 @@
     "proxy",
     "openai-compatible",
     "newapi",
+    "sub2api",
     "gateway",
     "protocol-direct",
     "oauth"

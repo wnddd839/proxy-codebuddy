@@ -123,6 +123,8 @@ test("normalizeApiPath collapses duplicated Claude Code v1 prefixes", () => {
   assert.equal(normalizeApiPath("/v1/v1/messages"), "/v1/messages");
   assert.equal(normalizeApiPath("/v1/v1/messages/count_tokens"), "/v1/messages/count_tokens");
   assert.equal(normalizeApiPath("/direct-admin/api/status"), "/direct-admin/api/status");
+  assert.equal(normalizeApiPath("/v1/models/"), "/v1/models");
+  assert.equal(normalizeApiPath("/models/"), "/models");
 });
 
 test("normalizeDirectModel strips ANSI styling artifacts from ccswitch model names", () => {

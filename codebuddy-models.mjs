@@ -111,6 +111,69 @@ export function toCodeBuddyAdminModels(rows = [], options = {}) {
     .filter(Boolean);
 }
 
+/** OpenAI-compatible model object for GET /v1/models and GET /v1/models/:id */
+export function toOpenAiModelObject(model = {}, options = {}) {
+  const created = Number.isFinite(Number(options.created))
+    ? Math.floor(Number(options.created))
+    : Math.floor(Date.now() / 1000);
+  const publicId = toCodeBuddyPublicModelId(
+    model?.id || model?.modelId || model?.upstreamId || model?.name || "",
+  );
+  if (!publicId) return null;
+  const upstreamId = String(model?.upstreamId || model?.modelId || "")
+    .trim()
+    .replace(/^codebuddy(?:\/|:)/i, "") || publicId.replace(/^codebuddy\//i, "");
+  const displayName = String(model?.displayName || model?.name || upstreamId || publicId).trim() || publicId;
+  return {
+    id: publicId,
+    object: "model",
+    created,
+    owned_by: String(model?.owned_by || options.ownedBy || "codebuddy"),
+    // Helpful extras for NewAPI / Sub2API style UIs (ignored by strict OpenAI clients)
+    display_name: displayName,
+    root: upstreamId || publicId,
+    parent: null,
+  };
+}
+
+export function buildOpenAiModelsListResponse(models = [], options = {}) {
+  const created = Number.isFinite(Number(options.created))
+    ? Math.floor(Number(options.created))
+    : Math.floor(Date.now() / 1000);
+  const seen = new Set();
+  const data = [];
+  for (const row of Array.isArray(models) ? models : []) {
+    const item = toOpenAiModelObject(row, { ...options, created });
+    if (!item || seen.has(item.id)) continue;
+    seen.add(item.id);
+    data.push(item);
+  }
+  if (data.length === 0) {
+    data.push(toOpenAiModelObject({ id: "auto", name: "Auto", owned_by: "codebuddy" }, { created }));
+  }
+  return {
+    object: "list",
+    data,
+  };
+}
+
+export function findOpenAiModelById(models = [], modelId = "", options = {}) {
+  const wanted = String(modelId || "").trim();
+  if (!wanted) return null;
+  const wantedPublic = toCodeBuddyPublicModelId(wanted);
+  const wantedBare = wanted.replace(/^codebuddy(?:\/|:)/i, "").trim() || "auto";
+  const list = buildOpenAiModelsListResponse(models, options).data;
+  return list.find((item) => {
+    const id = String(item?.id || "");
+    const bare = id.replace(/^codebuddy(?:\/|:)/i, "");
+    return id === wanted ||
+      id === wantedPublic ||
+      bare === wantedBare ||
+      id.toLowerCase() === wanted.toLowerCase() ||
+      id.toLowerCase() === wantedPublic.toLowerCase();
+  }) || null;
+}
+
 function extractModelsFromConfigPayload(payload = {}) {
   const root = payload?.data && typeof payload.data === "object" ? payload.data : payload;
   const rows = normalizeCodeBuddyModels(root?.models ? { models: root.models } : payload);

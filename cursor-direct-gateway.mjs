@@ -38,9 +38,12 @@ import {
   writeCodeBuddyAccountsStore,
 } from "./codebuddy-account-pool.mjs";
 import {
+  buildOpenAiModelsListResponse,
+  findOpenAiModelById,
   getCodeBuddySiteModelCatalog,
   listCodeBuddyModelsForAccount,
   toCodeBuddyAdminModels,
+  toOpenAiModelObject,
 } from "./codebuddy-models.mjs";
 import {
   buildCodeBuddyCliCredentialFromTokenData,
@@ -376,7 +379,12 @@ function normalizeApiPath(pathname) {
   while (normalized.startsWith("/v1/v1/")) {
     normalized = normalized.replace(/^\/v1\/v1(?=\/)/, "/v1");
   }
-  return normalized === "/v1/v1" ? "/v1" : normalized;
+  if (normalized === "/v1/v1") normalized = "/v1";
+  // OpenAI clients / reverse proxies often hit /v1/models/
+  if (normalized.length > 1 && normalized.endsWith("/")) {
+    normalized = normalized.replace(/\/+$/, "");
+  }
+  return normalized || "/";
 }
 
 function normalizeAnthropicModelAlias(model) {
@@ -562,6 +570,42 @@ async function listCodeBuddyModelsForAdmin(options = {}) {
   const result = cloneMetadataValue(payload);
   setMetadataCache(cache, { cacheKey, payload: result }, { now, ttlMs: config.modelsCacheTtlMs });
   return result;
+}
+
+/**
+ * Public OpenAI-compatible model catalog for downstream (NewAPI / Sub2API / clients).
+ * CodeBuddy-only: never blocks on Cursor auth.
+ */
+async function listPublicOpenAiModels(options = {}) {
+  const created = Math.floor(Date.now() / 1000);
+  let models = listConfiguredCodeBuddyModels();
+  try {
+    const listed = await listCodeBuddyModelsForAdmin({
+      fresh: options.fresh === true,
+      accountId: options.accountId || "",
+    });
+    if (Array.isArray(listed?.models) && listed.models.length > 0) {
+      models = listed.models;
+    }
+  } catch (error) {
+    log("warn", "codebuddy model list unavailable while building public /v1/models", {
+      error: error instanceof Error ? error.message : String(error),
+    });
+  }
+  return buildOpenAiModelsListResponse(models, { created, ownedBy: "codebuddy" });
+}
+
+async function getPublicOpenAiModel(modelId, options = {}) {
+  const created = Math.floor(Date.now() / 1000);
+  const listed = await listPublicOpenAiModels(options);
+  const found = findOpenAiModelById(listed.data, modelId, { created, ownedBy: "codebuddy" });
+  if (found) return found;
+  // Still accept well-formed codebuddy/* ids even if upstream list is stale
+  const publicId = String(modelId || "").trim();
+  if (/^codebuddy(?:\/|:|$)/i.test(publicId) || publicId === "auto") {
+    return toOpenAiModelObject({ id: publicId || "auto", owned_by: "codebuddy" }, { created });
+  }
+  return null;
 }
 
 function base64UrlDecode(input) {
@@ -6181,43 +6225,33 @@ async function handle(req, res) {
 
   if ((routePath === "/v1/models" || routePath === "/models") && req.method === "GET") {
     try {
-      const created = Math.floor(Date.now() / 1000);
-      let directModels = [];
-      try {
-        directModels = await listDirectModels();
-      } catch (error) {
-        log("warn", "direct model list unavailable while building proxy model list", {
-          error: error instanceof Error ? error.message : String(error),
-        });
-      }
-      let codeBuddyModels = listConfiguredCodeBuddyModels();
-      try {
-        const listed = await listCodeBuddyModelsForAdmin();
-        if (Array.isArray(listed?.models) && listed.models.length > 0) {
-          codeBuddyModels = listed.models;
-        }
-      } catch (error) {
-        log("warn", "codebuddy model list unavailable while building proxy model list", {
-          error: error instanceof Error ? error.message : String(error),
-        });
-      }
-      const response = json(200, {
-        object: "list",
-        data: [
-          ...directModels.map((model) => ({
-          id: model.id,
-          object: "model",
-          created,
-          owned_by: "cursor-direct",
-          })),
-          ...codeBuddyModels.map((model) => ({
-            id: model.id,
-            object: "model",
-            created,
-            owned_by: model.owned_by || "codebuddy",
-          })),
-        ],
+      const fresh = url.searchParams.get("fresh") === "1";
+      const payload = await listPublicOpenAiModels({ fresh });
+      const response = json(200, payload);
+      res.writeHead(response.status, response.headers);
+      res.end(response.body);
+    } catch (error) {
+      const response = openAiError(502, "upstream_error", error instanceof Error ? error.message : String(error));
+      res.writeHead(response.status, response.headers);
+      res.end(response.body);
+    }
+    return;
+  }
+
+  const openAiModelMatch = routePath.match(/^\/(?:v1\/)?models\/([^/]+)$/);
+  if (openAiModelMatch && req.method === "GET") {
+    try {
+      const modelId = decodeURIComponent(openAiModelMatch[1] || "").trim();
+      const model = await getPublicOpenAiModel(modelId, {
+        fresh: url.searchParams.get("fresh") === "1",
       });
+      if (!model) {
+        const response = openAiError(404, "invalid_request_error", `The model '${modelId}' does not exist`);
+        res.writeHead(response.status, response.headers);
+        res.end(response.body);
+        return;
+      }
+      const response = json(200, model);
       res.writeHead(response.status, response.headers);
       res.end(response.body);
     } catch (error) {
@@ -6963,6 +6997,8 @@ export {
   invalidateDirectMetadataCaches,
   isDirectAdminAuthorized,
   listDirectModels,
+  listPublicOpenAiModels,
+  getPublicOpenAiModel,
   normalizeApiPath,
   normalizeCodeBuddyCredentialImportRequest,
   DEFAULT_CURSOR_DIRECT_MODEL,
