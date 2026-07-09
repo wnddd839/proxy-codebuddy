@@ -1,4 +1,4 @@
-<p align="center">
+﻿<p align="center">
   <img src="docs/logo.svg" width="72" height="72" alt="CodeBuddy Proxy" />
 </p>
 
@@ -10,17 +10,17 @@
 </p>
 
 <p align="center">
-  <a href="https://wnddd839.github.io/cursor-proxy/"><img src="https://img.shields.io/badge/Product-Page-c45c26?style=flat-square" alt="Product Page" /></a>
-  <a href="https://github.com/wnddd839/cursor-proxy/blob/main/LICENSE"><img src="https://img.shields.io/badge/License-BSD--3--Clause-2f6b5a?style=flat-square" alt="License" /></a>
+  <a href="https://wnddd839.github.io/proxy-codebuddy/"><img src="https://img.shields.io/badge/Product-Page-c45c26?style=flat-square" alt="Product Page" /></a>
+  <a href="https://github.com/wnddd839/proxy-codebuddy/blob/main/LICENSE"><img src="https://img.shields.io/badge/License-BSD--3--Clause-2f6b5a?style=flat-square" alt="License" /></a>
   <a href="https://nodejs.org/"><img src="https://img.shields.io/badge/Node.js-%E2%89%A520-12140f?style=flat-square" alt="Node" /></a>
   <img src="https://img.shields.io/badge/Transport-protocol__direct-3a4034?style=flat-square" alt="protocol_direct" />
 </p>
 
 <p align="center">
-  <a href="https://wnddd839.github.io/cursor-proxy/">产品页</a> ·
+  <a href="https://wnddd839.github.io/proxy-codebuddy/">产品页</a> ·
   <a href="#快速开始">快速开始</a> ·
   <a href="#接入">接入 NewAPI</a> ·
-  <a href="https://github.com/wnddd839/cursor-proxy">GitHub</a>
+  <a href="https://github.com/wnddd839/proxy-codebuddy">GitHub</a>
 </p>
 
 ---
@@ -55,8 +55,8 @@
 ## 快速开始
 
 ```bash
-git clone https://github.com/wnddd839/cursor-proxy.git
-cd cursor-proxy
+git clone https://github.com/wnddd839/proxy-codebuddy.git
+cd proxy-codebuddy
 cp .env.example .env
 ```
 
@@ -112,7 +112,7 @@ curl http://127.0.0.1:32126/v1/chat/completions \
 
 更完整的介绍与视觉说明：
 
-**[https://wnddd839.github.io/cursor-proxy/](https://wnddd839.github.io/cursor-proxy/)**
+**[https://wnddd839.github.io/proxy-codebuddy/](https://wnddd839.github.io/proxy-codebuddy/)**
 
 ---
 

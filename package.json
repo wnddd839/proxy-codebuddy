@@ -1,5 +1,5 @@
-{
-  "name": "cursor-proxy",
+﻿{
+  "name": "proxy-codebuddy",
   "version": "0.2.0",
   "description": "CodeBuddy Proxy — OpenAI-compatible reverse proxy for CodeBuddy (protocol direct, OAuth, account pool, admin).",
   "type": "module",
@@ -17,11 +17,11 @@
   "license": "BSD-3-Clause",
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/wnddd839/cursor-proxy.git"
+    "url": "git+https://github.com/wnddd839/proxy-codebuddy.git"
   },
-  "homepage": "https://wnddd839.github.io/cursor-proxy/",
+  "homepage": "https://wnddd839.github.io/proxy-codebuddy/",
   "bugs": {
-    "url": "https://github.com/wnddd839/cursor-proxy/issues"
+    "url": "https://github.com/wnddd839/proxy-codebuddy/issues"
   },
   "keywords": [
     "codebuddy",
