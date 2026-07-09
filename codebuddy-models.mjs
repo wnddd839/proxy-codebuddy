@@ -19,8 +19,37 @@ const UPSTREAM_MODEL_LIST_PATHS = [
 
 const AUTO_MODEL = { id: "auto", name: "Auto", supportsTools: true };
 
+// International CLI catalog (from @tencent-ai/codebuddy-code product.json).
+// Upstream /v3/config on www.codebuddy.ai often returns no models; CLI still
+// exposes this local list and chat accepts these IDs for Pro/trial accounts.
+const GLOBAL_CLI_MODEL_CATALOG = [
+  AUTO_MODEL,
+  { id: "default-model", name: "Default", supportsTools: true, supportsImages: true },
+  { id: "default-model-lite", name: "Default-Lite", supportsTools: true, supportsImages: true },
+  { id: "gpt-5.5", name: "GPT-5.5", supportsTools: true, supportsImages: true },
+  { id: "gpt-5.4", name: "GPT-5.4", supportsTools: true, supportsImages: true },
+  { id: "gpt-5.3-codex", name: "GPT-5.3-Codex", supportsTools: true, supportsImages: true },
+  { id: "gpt-5.1-codex", name: "GPT-5.1-Codex", supportsTools: true, supportsImages: true },
+  { id: "gpt-5.1-codex-mini", name: "GPT-5.1-Codex-Mini", supportsTools: true, supportsImages: true },
+  { id: "gemini-3.1-pro", name: "Gemini-3.1-Pro", supportsTools: true, supportsImages: true },
+  { id: "gemini-3.0-flash", name: "Gemini-3.0-Flash", supportsTools: true, supportsImages: true },
+  { id: "gemini-3.5-flash", name: "Gemini-3.5-Flash", supportsTools: true, supportsImages: true },
+  { id: "gemini-2.5-flash", name: "Gemini-2.5-Flash", supportsTools: true, supportsImages: true },
+  { id: "gemini-3.1-flash-lite", name: "Gemini-3.1-flash-lite", supportsTools: true, supportsImages: true },
+  { id: "gemini-2.5-pro", name: "Gemini-2.5-Pro", supportsTools: true, supportsImages: true },
+  { id: "deepseek-v3-2-volc", name: "DeepSeek-V3.2", supportsTools: true },
+  { id: "glm-5.0", name: "GLM-5.0", supportsTools: true },
+  { id: "kimi-k2.5", name: "Kimi-K2.5", supportsTools: true, supportsImages: true },
+  { id: "gemini-3.0-pro-image", name: "Gemini-3.0-Pro-Image", supportsTools: true, supportsImages: true },
+  { id: "gemini-3.1-flash-image", name: "Gemini-3.1-Flash-Image", supportsTools: true, supportsImages: true },
+  { id: "gemini-2.5-flash-image", name: "Gemini-2.5-Flash-Image", supportsTools: true, supportsImages: true },
+  { id: "hunyuan-image-v3.0", name: "Hunyuan-Image-V3", supportsTools: true, supportsImages: true },
+  { id: "hunyuan-image-v2.0-general-edit", name: "Hunyuan-Image-Edit", supportsTools: true, supportsImages: true },
+  { id: "hunyuan-video-art", name: "Hunyuan-Video-Art", supportsTools: true },
+];
+
 export const CODEBUDDY_SITE_MODEL_CATALOG = {
-  global: [AUTO_MODEL],
+  global: GLOBAL_CLI_MODEL_CATALOG,
   domestic: [AUTO_MODEL],
 };
 
@@ -192,7 +221,14 @@ export async function fetchCodeBuddyModelsViaV3Config(options = {}) {
   const candidates = [];
   const primary = resolveModelDiscoveryBaseUrl(options);
   if (primary) candidates.push(primary);
-  if (!primary.includes("copilot.tencent.com")) {
+  const site = normalizeSite(options.site || "global");
+  const internetEnvironment = String(options.internetEnvironment || "").trim().toLowerCase();
+  const allowDomesticFallback = site === "domestic" ||
+    ["domestic", "cn", "china", "internal", "ioa"].includes(internetEnvironment) ||
+    primary.includes("codebuddy.cn") ||
+    primary.includes("copilot.tencent.com");
+  // Never fall back to CN endpoint for international accounts — that hides GPT/Gemini.
+  if (allowDomesticFallback && !primary.includes("copilot.tencent.com")) {
     candidates.push("https://copilot.tencent.com");
   }
 
@@ -419,11 +455,16 @@ export async function listCodeBuddyModelsForAccount(options = {}) {
 
     const upstream = await fetchCodeBuddyUpstreamModelList({ ...options, site, transport });
     if (upstream.ok) {
+      const merged = site === "global"
+        ? mergeModelRows(catalog, upstream.models)
+        : upstream.models;
       return {
         ok: true,
         site,
-        models: toCodeBuddyAdminModels(upstream.models, { source: upstream.source || "upstream" }),
-        modelsSource: upstream.source || "upstream",
+        models: toCodeBuddyAdminModels(merged, { source: upstream.source || "upstream" }),
+        modelsSource: site === "global" && merged.length > upstream.models.length
+          ? "v3_config+cli_catalog"
+          : (upstream.source || "upstream"),
         upstreamEndpoint: upstream.endpoint,
         message: daemonError
           ? `CLI ACP failed (${daemonError}); loaded models from ${upstream.endpoint || upstream.source}.`
@@ -434,14 +475,20 @@ export async function listCodeBuddyModelsForAccount(options = {}) {
 
   const upstream = await fetchCodeBuddyUpstreamModelList({ ...options, site, transport });
   if (upstream.ok) {
+    // International /v3/config is often sparse; merge CLI catalog so GPT/Gemini appear.
+    const merged = site === "global"
+      ? mergeModelRows(catalog, upstream.models)
+      : upstream.models;
     return {
       ok: true,
       site,
-      models: toCodeBuddyAdminModels(upstream.models, { source: upstream.source || "upstream" }),
-      modelsSource: upstream.source || "upstream",
+      models: toCodeBuddyAdminModels(merged, { source: upstream.source || "upstream" }),
+      modelsSource: site === "global" && merged.length > upstream.models.length
+        ? "v3_config+cli_catalog"
+        : (upstream.source || "upstream"),
       upstreamEndpoint: upstream.endpoint,
       message: upstream.source === "v3_config"
-        ? `Loaded ${upstream.models.length} model(s) from ${upstream.endpoint}.`
+        ? `Loaded ${merged.length} model(s) from ${upstream.endpoint}${site === "global" ? " + CLI catalog" : ""}.`
         : undefined,
     };
   }
@@ -451,11 +498,23 @@ export async function listCodeBuddyModelsForAccount(options = {}) {
     site,
     models: toCodeBuddyAdminModels(catalog, {
       source: "site_catalog",
-      verifiedIds: new Set(["auto"]),
+      verifiedIds: new Set(catalog.map((row) => row.id)),
     }),
     modelsSource: "site_catalog",
     message: upstream.error
-      ? `CodeBuddy model config fetch failed (${upstream.error}). Showing auto only.`
-      : "CodeBuddy model config unavailable; showing auto only.",
+      ? `CodeBuddy model config fetch failed (${upstream.error}). Showing ${catalog.length} catalog model(s).`
+      : `CodeBuddy model config unavailable; showing ${catalog.length} catalog model(s).`,
   };
+}
+
+function mergeModelRows(primary = [], secondary = []) {
+  const seen = new Set();
+  const out = [];
+  for (const row of [...(Array.isArray(primary) ? primary : []), ...(Array.isArray(secondary) ? secondary : [])]) {
+    const id = String(row?.id || row?.modelId || "").trim();
+    if (!id || seen.has(id)) continue;
+    seen.add(id);
+    out.push(typeof row === "string" ? { id: row, name: row } : row);
+  }
+  return out;
 }

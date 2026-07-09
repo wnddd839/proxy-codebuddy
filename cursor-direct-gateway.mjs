@@ -418,11 +418,17 @@ function resolveGatewayProviderModel(model) {
   const codeBuddyMatch = cleaned.match(/^codebuddy(?:(?:\/|:)(.*))?$/i);
   if (codeBuddyMatch) {
     const requestedModel = String(codeBuddyMatch[1] || "auto").trim() || "auto";
-    const upstreamModel = requestedModel === "default" ? "auto" : requestedModel;
+    // Upstream chat rejects bare "auto"/"default"; CLI uses "default-model".
+    const upstreamModel = ["auto", "default", "default-model"].includes(requestedModel)
+      ? "default-model"
+      : requestedModel;
+    const publicModel = ["auto", "default", "default-model"].includes(requestedModel)
+      ? "codebuddy/auto"
+      : `codebuddy/${upstreamModel}`;
     return {
       provider: "codebuddy",
       model: upstreamModel,
-      publicModel: `codebuddy/${upstreamModel}`,
+      publicModel,
     };
   }
 
@@ -1495,7 +1501,12 @@ function shouldRetryCodeBuddyWithNextAccount(error, selection, options = {}) {
   const message = String(error instanceof Error ? error.message : error || "");
   if (!message) return false;
   if (shouldRefreshCodeBuddyAfterFailure(error, selection, options)) return false;
-  return /11140|11101|request illegal|site mismatch|invalid request/i.test(message);
+  // 11101 is usually a request-shape/model issue, not a bad account. Retrying the
+  // only pool account just surfaces "No enabled CodeBuddy accounts...".
+  if (/\b11101\b|Parse message failed|invalid request/i.test(message) && !/11140|request illegal/i.test(message)) {
+    return false;
+  }
+  return /11140|request illegal|site mismatch/i.test(message);
 }
 
 function resolveCodeBuddyPoolSiteFilter(options = {}) {

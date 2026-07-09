@@ -224,7 +224,17 @@ function formatCodeBuddyCloudMessage(message = {}) {
 }
 
 export function ensureCodeBuddyUpstreamMessages(messages = []) {
-  return normalizeOpenAiMessages(messages).map(formatCodeBuddyCloudMessage);
+  const normalized = normalizeOpenAiMessages(messages).map(formatCodeBuddyCloudMessage);
+  // Upstream global chat often returns 11101 for user-only payloads (e.g. Sub2API
+  // connection tests that send just "hi"). Inject a minimal system message.
+  const hasSystem = normalized.some((message) => String(message?.role || "").toLowerCase() === "system");
+  if (!hasSystem && normalized.length > 0) {
+    return [
+      { role: "system", content: "You are a helpful assistant." },
+      ...normalized,
+    ];
+  }
+  return normalized;
 }
 
 export function isCodeBuddyUpstreamDebugEnabled() {
